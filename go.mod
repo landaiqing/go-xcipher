@@ -1,4 +1,4 @@
-module go-xcipher
+module github.com/landaiqing/go-xcipher
 
 go 1.24.0
 
