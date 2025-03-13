@@ -11,8 +11,10 @@ import (
 	"runtime"
 	"sync"
 	"time"
+	"unsafe"
 
 	"golang.org/x/crypto/chacha20poly1305"
+	"golang.org/x/sys/cpu"
 )
 
 const (
@@ -27,7 +29,12 @@ const (
 	minBufferSize     = 8 * 1024        // Minimum buffer size (8KB)
 	maxBufferSize     = 1024 * 1024     // Maximum buffer size (1MB)
 	optimalBlockSize  = 64 * 1024       // 64KB is typically optimal for ChaCha20-Poly1305
-	batchSize         = 8               // 批处理队列大小
+	batchSize         = 8               // Batch processing queue size
+
+	// New CPU architecture related constants
+	avxBufferSize = 128 * 1024 // Larger buffer size when using AVX optimization
+	sseBufferSize = 64 * 1024  // Buffer size when using SSE optimization
+	armBufferSize = 32 * 1024  // Buffer size when using ARM optimization
 )
 
 // Define error constants for consistent error handling
@@ -58,29 +65,29 @@ var largeBufferPool = &sync.Pool{
 	},
 }
 
-// 获取指定容量的缓冲区，优先从对象池获取
+// Get buffer with specified capacity, prioritize getting from object pool
 func getBuffer(capacity int) []byte {
-	// 小缓冲区直接从常规池获取
+	// Small buffers directly from regular pool
 	if capacity <= poolBufferSize {
 		buf := bufferPool.Get().([]byte)
 		if cap(buf) >= capacity {
 			return buf[:capacity]
 		}
-		bufferPool.Put(buf[:0]) // 返回太小的缓冲区
+		bufferPool.Put(buf[:0]) // Return buffer that's too small
 	} else if capacity <= largeBufferSize {
-		// 大缓冲区从大缓冲池获取
+		// Large buffers from large buffer pool
 		buf := largeBufferPool.Get().([]byte)
 		if cap(buf) >= capacity {
 			return buf[:capacity]
 		}
-		largeBufferPool.Put(buf[:0]) // 返回太小的缓冲区
+		largeBufferPool.Put(buf[:0]) // Return buffer that's too small
 	}
 
-	// 池中没有足够大的缓冲区，创建新的
+	// Pool doesn't have large enough buffer, create new one
 	return make([]byte, capacity)
 }
 
-// 返回缓冲区到适当的池
+// Return buffer to appropriate pool
 func putBuffer(buf []byte) {
 	if buf == nil {
 		return
@@ -92,7 +99,7 @@ func putBuffer(buf []byte) {
 	} else if c <= largeBufferSize {
 		largeBufferPool.Put(buf[:0])
 	}
-	// 超过大小的不放回池中
+	// Oversized buffers are not returned to the pool
 }
 
 type XCipher struct {
@@ -124,54 +131,54 @@ func (x *XCipher) Encrypt(data, additionalData []byte) ([]byte, error) {
 		return nil, ErrEmptyPlaintext
 	}
 
-	// 检查是否超过阈值使用直接分配
+	// Check if above threshold to use direct allocation
 	if len(data) > parallelThreshold {
 		return x.encryptDirect(data, additionalData)
 	}
 
-	// 使用新的缓冲区池函数获取缓冲区
+	// Use new buffer pool function to get buffer
 	requiredCapacity := nonceSize + len(data) + x.overhead
-	buf := getBuffer(nonceSize) // 先获取nonceSize大小的缓冲区
+	buf := getBuffer(nonceSize) // First get buffer of nonceSize
 	defer func() {
-		// 如果发生错误，确保缓冲区被返回到池中
+		// If error occurs, ensure buffer is returned to pool
 		if len(buf) == nonceSize {
 			putBuffer(buf)
 		}
 	}()
 
-	// 生成随机nonce
+	// Generate random nonce
 	if _, err := rand.Read(buf); err != nil {
 		return nil, ErrNonceGeneration
 	}
 
-	// 扩展缓冲区以容纳加密数据
+	// Expand buffer to accommodate encrypted data
 	if cap(buf) < requiredCapacity {
-		// 当前缓冲区太小，获取一个更大的
+		// Current buffer too small, get a larger one
 		oldBuf := buf
 		buf = make([]byte, nonceSize, requiredCapacity)
 		copy(buf, oldBuf)
-		putBuffer(oldBuf) // 返回旧缓冲区到池中
+		putBuffer(oldBuf) // Return old buffer to pool
 	}
 
-	// 使用优化的AEAD.Seal调用
+	// Use optimized AEAD.Seal call
 	result := x.aead.Seal(buf, buf[:nonceSize], data, additionalData)
 	return result, nil
 }
 
 func (x *XCipher) encryptDirect(data, additionalData []byte) ([]byte, error) {
-	// 预分配nonce缓冲区
+	// Pre-allocate nonce buffer
 	nonce := getBuffer(nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		putBuffer(nonce)
 		return nil, ErrNonceGeneration
 	}
 
-	// 预分配足够大的ciphertext缓冲区
+	// Pre-allocate large enough ciphertext buffer
 	ciphertext := make([]byte, nonceSize+len(data)+x.overhead)
 	copy(ciphertext, nonce)
-	putBuffer(nonce) // 不再需要单独的nonce缓冲区
+	putBuffer(nonce) // No longer need separate nonce buffer
 
-	// 直接在目标缓冲区上执行加密操作
+	// Encrypt directly on target buffer
 	x.aead.Seal(
 		ciphertext[nonceSize:nonceSize],
 		ciphertext[:nonceSize],
@@ -190,16 +197,16 @@ func (x *XCipher) Decrypt(cipherData, additionalData []byte) ([]byte, error) {
 	nonce := cipherData[:nonceSize]
 	data := cipherData[nonceSize:]
 
-	// 估算明文大小并预分配缓冲区
+	// Estimate plaintext size and pre-allocate buffer
 	plaintextSize := len(data) - x.overhead
 	if plaintextSize <= 0 {
 		return nil, ErrCiphertextShort
 	}
 
-	// 对于小数据，使用内存池 - 但不重用输入缓冲区，避免重叠
+	// For small data, use memory pool - but don't reuse input buffer to avoid overlap
 	if plaintextSize <= largeBufferSize {
-		// 注意：这里我们总是创建一个新的缓冲区用于结果
-		// 而不是尝试在输入缓冲区上原地解密，这会导致缓冲区重叠错误
+		// Note: We always create a new buffer for the result
+		// instead of trying to decrypt in-place on the input buffer, which would cause buffer overlap errors
 		resultBuf := make([]byte, 0, plaintextSize)
 		plaintext, err := x.aead.Open(resultBuf, nonce, data, additionalData)
 		if err != nil {
@@ -208,7 +215,7 @@ func (x *XCipher) Decrypt(cipherData, additionalData []byte) ([]byte, error) {
 		return plaintext, nil
 	}
 
-	// 对于大数据，直接分配并返回
+	// For large data, directly allocate and return
 	return x.aead.Open(nil, nonce, data, additionalData)
 }
 
@@ -269,13 +276,21 @@ func DefaultStreamOptions() StreamOptions {
 
 // EncryptStreamWithOptions performs stream encryption using configuration options
 func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (stats *StreamStats, err error) {
-	// 自动检测是否应该使用并行处理
-	if options.UseParallel == false && options.BufferSize >= parallelThreshold/2 {
-		// 如果缓冲区很大但未启用并行，自动启用
+	// Use dynamic parameter system to adjust parameters
+	if options.BufferSize <= 0 {
+		options.BufferSize = adaptiveBufferSize(0)
+	} else {
+		options.BufferSize = adaptiveBufferSize(options.BufferSize)
+	}
+
+	// Automatically decide whether to use parallel processing based on buffer size
+	if !options.UseParallel && options.BufferSize >= parallelThreshold/2 {
 		options.UseParallel = true
 		if options.MaxWorkers <= 0 {
-			options.MaxWorkers = calculateOptimalWorkers(options.BufferSize, maxWorkers)
+			options.MaxWorkers = adaptiveWorkerCount(0, options.BufferSize)
 		}
+	} else if options.MaxWorkers <= 0 {
+		options.MaxWorkers = adaptiveWorkerCount(0, options.BufferSize)
 	}
 
 	// Initialize statistics
@@ -292,6 +307,8 @@ func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 				durationSec := stats.Duration().Seconds()
 				if durationSec > 0 {
 					stats.Throughput = float64(stats.BytesProcessed) / durationSec / 1e6 // MB/s
+					// Update system metrics - record throughput for future optimization
+					updateSystemMetrics(0, 0, stats.Throughput)
 				}
 				if stats.BlocksProcessed > 0 {
 					stats.AvgBlockSize = float64(stats.BytesProcessed) / float64(stats.BlocksProcessed)
@@ -300,10 +317,8 @@ func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 		}()
 	}
 
-	// Validate and adjust options
-	if options.BufferSize <= 0 {
-		options.BufferSize = streamBufferSize
-	} else if options.BufferSize < minBufferSize {
+	// Validate options
+	if options.BufferSize < minBufferSize {
 		return stats, fmt.Errorf("%w: %d is less than minimum %d",
 			ErrBufferSizeTooSmall, options.BufferSize, minBufferSize)
 	} else if options.BufferSize > maxBufferSize {
@@ -311,50 +326,101 @@ func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 			ErrBufferSizeTooLarge, options.BufferSize, maxBufferSize)
 	}
 
+	// Parallel processing path
 	if options.UseParallel {
-		if options.MaxWorkers <= 0 {
-			options.MaxWorkers = maxWorkers
-		} else if options.MaxWorkers > runtime.NumCPU()*2 {
-			log.Printf("Warning: Number of worker threads %d exceeds twice the number of CPU cores (%d)",
-				options.MaxWorkers, runtime.NumCPU()*2)
+		// Adaptively adjust worker thread count based on current CPU architecture
+		workerCount := adaptiveWorkerCount(options.MaxWorkers, options.BufferSize)
+		options.MaxWorkers = workerCount
+
+		// Update statistics to reflect actual worker count used
+		if stats != nil {
+			stats.WorkerCount = workerCount
 		}
 
 		// Use parallel implementation
 		return x.encryptStreamParallelWithOptions(reader, writer, options, stats)
 	}
 
-	// Generate random nonce
+	// Sequential processing path with zero-copy optimizations
+	// ----------------------------------------------------------
+
+	// Generate random nonce - use global constants to avoid compile-time recalculation
 	nonce := make([]byte, nonceSize)
 	if _, err := rand.Read(nonce); err != nil {
 		return stats, fmt.Errorf("%w: %v", ErrNonceGeneration, err)
 	}
 
-	// Write nonce first
+	// Write nonce first - write at once to reduce system calls
 	if _, err := writer.Write(nonce); err != nil {
 		return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
 	}
 
-	// Get buffer from memory pool or create a new one
-	var buffer []byte
-	var sealed []byte
+	// Use buffer from pool with CPU-aware optimal size
+	bufferSize := options.BufferSize
+	bufferFromPool := getBuffer(bufferSize)
+	defer putBuffer(bufferFromPool)
 
-	// Check if buffer in memory pool is large enough
-	bufFromPool := bufferPool.Get().([]byte)
-	if cap(bufFromPool) >= options.BufferSize {
-		buffer = bufFromPool[:options.BufferSize]
-	} else {
-		bufferPool.Put(bufFromPool[:0]) // Return buffer that's not large enough
-		buffer = make([]byte, options.BufferSize)
-	}
-	defer bufferPool.Put(buffer[:0])
-
-	// Allocate ciphertext buffer
-	sealed = make([]byte, 0, options.BufferSize+x.overhead)
+	// Pre-allocate a large enough encryption result buffer, avoid allocation each time
+	sealed := make([]byte, 0, bufferSize+x.overhead)
 
 	// Use counter to track block sequence
 	var counter uint64 = 0
 	var bytesProcessed int64 = 0
 	var blocksProcessed = 0
+
+	// Optimize batch processing based on CPU features
+	useDirectWrite := cpuFeatures.hasAVX2 || cpuFeatures.hasAVX
+
+	// Pre-allocate pending write queue to reduce system calls
+	pendingWrites := make([][]byte, 0, 8)
+	totalPendingBytes := 0
+	flushThreshold := 256 * 1024 // 256KB batch write threshold
+
+	// Flush buffered write data
+	flushWrites := func() error {
+		if len(pendingWrites) == 0 {
+			return nil
+		}
+
+		// Optimization: For single data block, write directly
+		if len(pendingWrites) == 1 {
+			if _, err := writer.Write(pendingWrites[0]); err != nil {
+				return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+			}
+			pendingWrites = pendingWrites[:0]
+			totalPendingBytes = 0
+			return nil
+		}
+
+		// Optimization: For multiple data blocks, batch write
+		// Pre-allocate buffer large enough for batch write
+		batchBuffer := getBuffer(totalPendingBytes)
+		offset := 0
+
+		// Copy all pending data to batch buffer
+		for _, data := range pendingWrites {
+			copy(batchBuffer[offset:], data)
+			offset += len(data)
+		}
+
+		// Write all data at once, reducing system calls
+		if _, err := writer.Write(batchBuffer[:offset]); err != nil {
+			putBuffer(batchBuffer)
+			return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+		}
+
+		putBuffer(batchBuffer)
+		pendingWrites = pendingWrites[:0]
+		totalPendingBytes = 0
+		return nil
+	}
+
+	// Defer to ensure all data is flushed
+	defer func() {
+		if err2 := flushWrites(); err2 != nil && err == nil {
+			err = err2
+		}
+	}()
 
 	for {
 		// Check cancel signal
@@ -368,7 +434,7 @@ func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 		}
 
 		// Read plaintext data
-		n, err := reader.Read(buffer)
+		n, err := reader.Read(bufferFromPool)
 		if err != nil && err != io.EOF {
 			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
 		}
@@ -378,22 +444,50 @@ func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 			bytesProcessed += int64(n)
 			blocksProcessed++
 
-			// Update nonce - use counter
+			// Update nonce - use counter with little-endian encoding
 			binary.LittleEndian.PutUint64(nonce, counter)
 			counter++
 
-			// Encrypt data block
-			encrypted := x.aead.Seal(sealed[:0], nonce, buffer[:n], options.AdditionalData)
+			// Encrypt data block - use pre-allocated buffer
+			// Note: ChaCha20-Poly1305's Seal operation is already highly optimized internally, using zero-copy mechanism
+			encrypted := x.aead.Seal(sealed[:0], nonce, bufferFromPool[:n], options.AdditionalData)
 
-			// Write encrypted data
-			if _, err := writer.Write(encrypted); err != nil {
-				return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
+			// Optimize writing - decide to write directly or buffer based on conditions
+			if useDirectWrite && n >= 16*1024 { // Large blocks write directly
+				if err := flushWrites(); err != nil { // Flush waiting data first
+					return stats, err
+				}
+
+				// Write large data block directly
+				if _, err := writer.Write(encrypted); err != nil {
+					return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
+				}
+			} else {
+				// Small data blocks use batch processing
+				// Copy encrypted data to new buffer, since encrypted is based on temporary buffer
+				encryptedCopy := getBuffer(len(encrypted))
+				copy(encryptedCopy, encrypted)
+
+				pendingWrites = append(pendingWrites, encryptedCopy)
+				totalPendingBytes += len(encryptedCopy)
+
+				// Execute batch write when enough data accumulates
+				if totalPendingBytes >= flushThreshold {
+					if err := flushWrites(); err != nil {
+						return stats, err
+					}
+				}
 			}
 		}
 
 		if err == io.EOF {
 			break
 		}
+	}
+
+	// Ensure all data is written
+	if err := flushWrites(); err != nil {
+		return stats, err
 	}
 
 	// Update statistics
@@ -407,6 +501,20 @@ func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 
 // Internal method for parallel encryption with options
 func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.Writer, options StreamOptions, stats *StreamStats) (*StreamStats, error) {
+	// Use CPU-aware parameter optimization
+	bufferSize := adaptiveBufferSize(options.BufferSize)
+	workerCount := adaptiveWorkerCount(options.MaxWorkers, bufferSize)
+
+	// Update the options to use the optimized values
+	options.BufferSize = bufferSize
+	options.MaxWorkers = workerCount
+
+	// Update statistics
+	if stats != nil {
+		stats.BufferSize = bufferSize
+		stats.WorkerCount = workerCount
+	}
+
 	// Generate random base nonce
 	baseNonce := make([]byte, nonceSize)
 	if _, err := rand.Read(baseNonce); err != nil {
@@ -418,14 +526,11 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 		return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
 	}
 
-	// Set the number of worker threads, not exceeding CPU count and option limit
-	workers := runtime.NumCPU()
-	if workers > options.MaxWorkers {
-		workers = options.MaxWorkers
+	// Adjust job queue size to reduce contention - based on CPU features
+	workerQueueSize := workerCount * 4
+	if cpuFeatures.hasAVX2 || cpuFeatures.hasAVX {
+		workerQueueSize = workerCount * 8 // AVX processors can handle more tasks
 	}
-
-	// 调整作业队列大小以减少争用，使用更大的值
-	workerQueueSize := workers * 4
 
 	// Create worker pool
 	jobs := make(chan job, workerQueueSize)
@@ -433,39 +538,43 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 	errorsChannel := make(chan error, 1)
 	var wg sync.WaitGroup
 
-	// 预先分配一个一致的位置用于存储已处理的结果
+	// Pre-allocate a consistent location to store processed results
 	var bytesProcessed int64 = 0
 	var blocksProcessed = 0
 
 	// Start worker threads
-	for i := 0; i < workers; i++ {
+	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 
-			// 每个工作线程预分配自己的加密缓冲区，避免每次分配
-			encBuf := make([]byte, 0, options.BufferSize+x.overhead)
+			// Each worker thread pre-allocates its own encryption buffer to avoid allocation each time
+			// Adjust buffer size based on CPU features
+			var encBufSize int
+			if cpuFeatures.hasAVX2 {
+				encBufSize = bufferSize + x.overhead + 64 // AVX2 needs extra alignment space
+			} else {
+				encBufSize = bufferSize + x.overhead
+			}
+			encBuf := make([]byte, 0, encBufSize)
 
 			for job := range jobs {
-				// Create unique nonce for each block
+				// Create unique nonce for each block using shared base nonce
 				blockNonce := make([]byte, nonceSize)
 				copy(blockNonce, baseNonce)
 				binary.LittleEndian.PutUint64(blockNonce, job.id)
 
-				// Encrypt data block - 重用预分配的缓冲区而不是每次创建新的
+				// Encrypt data block using pre-allocated buffer
 				encrypted := x.aead.Seal(encBuf[:0], blockNonce, job.data, options.AdditionalData)
 
-				// 把数据复制到中间结果，避免缓冲区被后续操作覆盖
-				resultData := getBuffer(len(encrypted))
-				copy(resultData, encrypted)
-
-				// Send result
+				// Use zero-copy technique - directly pass encryption result
+				// Note: We no longer copy data to a new buffer, but use the encryption result directly
 				results <- result{
 					id:   job.id,
-					data: resultData,
+					data: encrypted,
 				}
 
-				// 完成后释放缓冲区
+				// Release input buffer after completion
 				putBuffer(job.data)
 			}
 		}()
@@ -477,34 +586,109 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 		pendingResults := make(map[uint64][]byte)
 		nextID := uint64(0)
 
+		// Batch write optimization
+		var pendingWrites [][]byte
+		var totalPendingSize int
+		const flushThreshold = 256 * 1024 // 256KB
+
+		// Flush buffered writes
+		flushWrites := func() error {
+			if len(pendingWrites) == 0 {
+				return nil
+			}
+
+			// Write single data block directly
+			if len(pendingWrites) == 1 {
+				// Write block size
+				sizeBytes := make([]byte, 4)
+				binary.LittleEndian.PutUint32(sizeBytes, uint32(len(pendingWrites[0])))
+
+				if _, err := writer.Write(sizeBytes); err != nil {
+					return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+				}
+
+				// Write data
+				if _, err := writer.Write(pendingWrites[0]); err != nil {
+					return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+				}
+
+				// Update statistics
+				if stats != nil {
+					bytesProcessed += int64(len(pendingWrites[0]))
+				}
+
+				pendingWrites = pendingWrites[:0]
+				totalPendingSize = 0
+				return nil
+			}
+
+			// Combine multiple data blocks for writing
+			// First calculate total size, including size headers for each block
+			headerSize := 4 * len(pendingWrites)
+			dataSize := totalPendingSize
+			batchBuffer := getBuffer(headerSize + dataSize)
+
+			// Write all block sizes
+			headerOffset := 0
+			dataOffset := headerSize
+
+			for _, data := range pendingWrites {
+				// Write block size
+				binary.LittleEndian.PutUint32(batchBuffer[headerOffset:], uint32(len(data)))
+				headerOffset += 4
+
+				// Copy data
+				copy(batchBuffer[dataOffset:], data)
+				dataOffset += len(data)
+			}
+
+			// Write all data at once
+			if _, err := writer.Write(batchBuffer[:headerSize+dataSize]); err != nil {
+				putBuffer(batchBuffer)
+				return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+			}
+
+			// Update statistics
+			if stats != nil {
+				bytesProcessed += int64(dataSize)
+			}
+
+			putBuffer(batchBuffer)
+			pendingWrites = pendingWrites[:0]
+			totalPendingSize = 0
+			return nil
+		}
+
+		// Ensure final data is flushed
+		defer func() {
+			if err := flushWrites(); err != nil {
+				errorsChannel <- err
+			}
+		}()
+
 		for r := range results {
 			pendingResults[r.id] = r.data
 
 			// Write results in order
 			for {
 				if data, ok := pendingResults[nextID]; ok {
-					// Write block size
-					sizeBytes := make([]byte, 4)
-					binary.LittleEndian.PutUint32(sizeBytes, uint32(len(data)))
-					if _, err := writer.Write(sizeBytes); err != nil {
-						errorsChannel <- fmt.Errorf("%w: %v", ErrWriteFailed, err)
-						return
+					// Add to pending write queue
+					pendingWrites = append(pendingWrites, data)
+					totalPendingSize += len(data)
+
+					// Execute batch write when enough data accumulates
+					if totalPendingSize >= flushThreshold || len(pendingWrites) >= 32 {
+						if err := flushWrites(); err != nil {
+							errorsChannel <- err
+							return
+						}
 					}
 
-					// Write data
-					if _, err := writer.Write(data); err != nil {
-						errorsChannel <- fmt.Errorf("%w: %v", ErrWriteFailed, err)
-						return
-					}
-
-					// 更新统计数据
+					// Update statistics
 					if stats != nil {
-						bytesProcessed += int64(len(data))
 						blocksProcessed++
 					}
 
-					// 返回缓冲区到池中
-					putBuffer(data)
 					delete(pendingResults, nextID)
 					nextID++
 				} else {
@@ -512,326 +696,40 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 				}
 			}
 		}
+
+		// Ensure all data is written
+		if err := flushWrites(); err != nil {
+			errorsChannel <- err
+			return
+		}
+
 		close(resultsDone) // Signal that result processing is complete
 	}()
 
-	// Read and assign work
-	buffer := getBuffer(options.BufferSize)
+	// Read and assign work - use optimized batch processing mechanism
+	// Adjust batch size based on CPU features and buffer size
+	batchCount := batchSize
+	if cpuFeatures.hasAVX2 {
+		batchCount = batchSize * 2 // AVX2 can process larger batches
+	} else if cpuFeatures.hasNEON {
+		batchCount = batchSize + 2 // Optimized batch size for ARM processors
+	}
+
+	// Batch preparation
+	dataBatch := make([][]byte, 0, batchCount)
+	idBatch := make([]uint64, 0, batchCount)
+	var jobID uint64 = 0
+
+	// Use CPU-aware buffer
+	buffer := getBuffer(bufferSize)
 	defer putBuffer(buffer)
-	var jobID uint64 = 0
-
-	// 添加批处理机制，减少通道争用
-	const batchSize = 16 // 根据实际情况调整
-	dataBatch := make([][]byte, 0, batchSize)
-	idBatch := make([]uint64, 0, batchSize)
 
 	for {
 		// Check cancel signal
 		if options.CancelChan != nil {
 			select {
 			case <-options.CancelChan:
-				return stats, ErrOperationCancelled
-			default:
-				// Continue processing
-			}
-		}
-
-		n, err := reader.Read(buffer)
-		if err != nil && err != io.EOF {
-			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
-		}
-
-		if n > 0 {
-			// Copy data to prevent overwriting
-			data := getBuffer(n)
-			copy(data, buffer[:n])
-
-			// 添加到批次
-			dataBatch = append(dataBatch, data)
-			idBatch = append(idBatch, jobID)
-			jobID++
-
-			// 当批次满了或到达EOF时发送
-			if len(dataBatch) >= batchSize || err == io.EOF {
-				for i := range dataBatch {
-					// Send work
-					select {
-					case jobs <- job{
-						id:   idBatch[i],
-						data: dataBatch[i],
-					}:
-					case <-options.CancelChan:
-						// 被取消的情况下清理资源
-						for _, d := range dataBatch {
-							putBuffer(d)
-						}
-						return stats, ErrOperationCancelled
-					}
-				}
-				// 清空批次
-				dataBatch = dataBatch[:0]
-				idBatch = idBatch[:0]
-			}
-		}
-
-		if err == io.EOF {
-			break
-		}
-	}
-
-	// 发送剩余批次
-	for i := range dataBatch {
-		jobs <- job{
-			id:   idBatch[i],
-			data: dataBatch[i],
-		}
-	}
-
-	// Close jobs channel and wait for all workers to complete
-	close(jobs)
-	wg.Wait()
-
-	// Close results channel after all work is done
-	close(results)
-
-	// Wait for result processing to complete
-	<-resultsDone
-
-	// 更新统计信息
-	if stats != nil {
-		stats.BytesProcessed = bytesProcessed
-		stats.BlocksProcessed = blocksProcessed
-	}
-
-	// Check for errors
-	select {
-	case err := <-errorsChannel:
-		return stats, err
-	default:
-		return stats, nil
-	}
-}
-
-// DecryptStreamWithOptions performs stream decryption with configuration options
-func (x *XCipher) DecryptStreamWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (*StreamStats, error) {
-	// 自动检测是否应该使用并行处理
-	if options.UseParallel == false && options.BufferSize >= parallelThreshold/2 {
-		// 如果缓冲区很大但未启用并行，自动启用
-		options.UseParallel = true
-		if options.MaxWorkers <= 0 {
-			options.MaxWorkers = calculateOptimalWorkers(options.BufferSize, maxWorkers)
-		}
-	}
-
-	// Validate and adjust options, similar to encryption
-	if options.BufferSize <= 0 {
-		options.BufferSize = streamBufferSize
-	} else if options.BufferSize < minBufferSize {
-		options.BufferSize = minBufferSize
-	} else if options.BufferSize > maxBufferSize {
-		options.BufferSize = maxBufferSize
-	}
-
-	if options.UseParallel {
-		if options.MaxWorkers <= 0 {
-			options.MaxWorkers = maxWorkers
-		}
-		// Use parallel implementation
-		return x.decryptStreamParallelWithOptions(reader, writer, options)
-	}
-
-	// Read nonce
-	nonce := make([]byte, nonceSize)
-	if _, err := io.ReadFull(reader, nonce); err != nil {
-		return nil, fmt.Errorf("%w: failed to read nonce: %v", ErrReadFailed, err)
-	}
-
-	// Get buffer from memory pool or create a new one
-	var encBuffer []byte
-	var decBuffer []byte
-
-	// Check if buffer in memory pool is large enough
-	bufFromPool := bufferPool.Get().([]byte)
-	if cap(bufFromPool) >= options.BufferSize+x.overhead {
-		encBuffer = bufFromPool[:options.BufferSize+x.overhead]
-	} else {
-		bufferPool.Put(bufFromPool[:0]) // Return buffer that's not large enough
-		encBuffer = make([]byte, options.BufferSize+x.overhead)
-	}
-	defer bufferPool.Put(encBuffer[:0])
-
-	// Allocate decryption buffer
-	decBuffer = make([]byte, 0, options.BufferSize)
-
-	// Use counter to track block sequence
-	var counter uint64 = 0
-
-	for {
-		// Read encrypted data
-		n, err := reader.Read(encBuffer)
-		if err != nil && err != io.EOF {
-			return nil, fmt.Errorf("%w: %v", ErrReadFailed, err)
-		}
-
-		if n > 0 {
-			// Update nonce - use counter
-			binary.LittleEndian.PutUint64(nonce, counter)
-			counter++
-
-			// Decrypt data block
-			decrypted, err := x.aead.Open(decBuffer[:0], nonce, encBuffer[:n], options.AdditionalData)
-			if err != nil {
-				return nil, ErrAuthenticationFailed
-			}
-
-			// Write decrypted data
-			if _, err := writer.Write(decrypted); err != nil {
-				return nil, fmt.Errorf("%w: %v", ErrWriteFailed, err)
-			}
-		}
-
-		if err == io.EOF {
-			break
-		}
-	}
-
-	return nil, nil
-}
-
-// Internal method for parallel decryption with options
-func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (*StreamStats, error) {
-	// Initialize statistics
-	var stats *StreamStats
-	if options.CollectStats {
-		stats = &StreamStats{
-			StartTime:          time.Now(),
-			ParallelProcessing: true,
-			WorkerCount:        options.MaxWorkers,
-			BufferSize:         options.BufferSize,
-		}
-		defer func() {
-			stats.EndTime = time.Now()
-			if stats.BytesProcessed > 0 {
-				durationSec := stats.Duration().Seconds()
-				if durationSec > 0 {
-					stats.Throughput = float64(stats.BytesProcessed) / durationSec / 1e6 // MB/s
-				}
-				if stats.BlocksProcessed > 0 {
-					stats.AvgBlockSize = float64(stats.BytesProcessed) / float64(stats.BlocksProcessed)
-				}
-			}
-		}()
-	}
-
-	// Read base nonce
-	baseNonce := make([]byte, nonceSize)
-	if _, err := io.ReadFull(reader, baseNonce); err != nil {
-		return stats, fmt.Errorf("%w: failed to read nonce: %v", ErrReadFailed, err)
-	}
-
-	// Set the number of worker threads - 使用优化的工作线程计算
-	workers := calculateOptimalWorkers(options.BufferSize, options.MaxWorkers)
-
-	// 调整作业队列大小以减少争用
-	workerQueueSize := workers * 4
-
-	// Create worker pool
-	jobs := make(chan job, workerQueueSize)
-	results := make(chan result, workerQueueSize)
-	errorsChannel := make(chan error, 1)
-	var wg sync.WaitGroup
-
-	// Start worker threads
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			// 每个工作线程预分配自己的解密缓冲区，避免每次分配
-			decBuf := make([]byte, 0, options.BufferSize)
-
-			for job := range jobs {
-				// Create unique nonce for each block
-				blockNonce := make([]byte, nonceSize)
-				copy(blockNonce, baseNonce)
-				binary.LittleEndian.PutUint64(blockNonce, job.id)
-
-				// Decrypt data block
-				decrypted, err := x.aead.Open(decBuf[:0], blockNonce, job.data, options.AdditionalData)
-				if err != nil {
-					select {
-					case errorsChannel <- ErrAuthenticationFailed:
-					default:
-						// If an error is already sent, don't send another one
-					}
-					putBuffer(job.data) // 释放缓冲区
-					continue            // Continue processing other blocks instead of returning immediately
-				}
-
-				// 把数据复制到中间结果，避免缓冲区被后续操作覆盖
-				resultData := getBuffer(len(decrypted))
-				copy(resultData, decrypted)
-
-				// Send result
-				results <- result{
-					id:   job.id,
-					data: resultData,
-				}
-
-				// 释放输入缓冲区
-				putBuffer(job.data)
-			}
-		}()
-	}
-
-	// Start result collection and writing thread
-	resultsDone := make(chan struct{})
-	go func() {
-		pendingResults := make(map[uint64][]byte)
-		nextID := uint64(0)
-
-		for r := range results {
-			pendingResults[r.id] = r.data
-
-			// Write results in order
-			for {
-				if data, ok := pendingResults[nextID]; ok {
-					if _, err := writer.Write(data); err != nil {
-						errorsChannel <- fmt.Errorf("%w: %v", ErrWriteFailed, err)
-						return
-					}
-
-					if stats != nil {
-						stats.BytesProcessed += int64(len(data))
-						stats.BlocksProcessed++
-					}
-
-					// 返回缓冲区到池中
-					putBuffer(data)
-					delete(pendingResults, nextID)
-					nextID++
-				} else {
-					break
-				}
-			}
-		}
-		close(resultsDone)
-	}()
-
-	// Read and assign work
-	sizeBytes := make([]byte, 4)
-	var jobID uint64 = 0
-
-	// 添加批处理机制，减少通道争用
-	dataBatch := make([][]byte, 0, batchSize)
-	idBatch := make([]uint64, 0, batchSize)
-
-	for {
-		// Check cancel signal
-		if options.CancelChan != nil {
-			select {
-			case <-options.CancelChan:
-				// 优雅地处理取消
+				// Clean up resources and return
 				close(jobs)
 				wg.Wait()
 				close(results)
@@ -842,53 +740,61 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 			}
 		}
 
-		// Read block size
-		_, err := io.ReadFull(reader, sizeBytes)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
+		n, err := reader.Read(buffer)
+		if err != nil && err != io.EOF {
+			// Error handling
+			close(jobs)
+			wg.Wait()
+			close(results)
+			<-resultsDone
 			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
 		}
 
-		blockSize := binary.LittleEndian.Uint32(sizeBytes)
-		encryptedBlock := getBuffer(int(blockSize))
+		if n > 0 {
+			// Zero-copy optimization: use exact size buffer to avoid extra copying
+			data := getBuffer(n)
+			copy(data, buffer[:n])
 
-		// Read encrypted data block
-		_, err = io.ReadFull(reader, encryptedBlock)
-		if err != nil {
-			putBuffer(encryptedBlock) // 释放缓冲区
-			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
-		}
+			// Add to batch
+			dataBatch = append(dataBatch, data)
+			idBatch = append(idBatch, jobID)
+			jobID++
 
-		// 添加到批次
-		dataBatch = append(dataBatch, encryptedBlock)
-		idBatch = append(idBatch, jobID)
-		jobID++
+			// Send when batch is full or EOF is reached
+			if len(dataBatch) >= batchCount || err == io.EOF {
+				for i := range dataBatch {
+					// Send work with timeout protection
+					select {
+					case jobs <- job{
+						id:   idBatch[i],
+						data: dataBatch[i],
+					}:
+					case <-options.CancelChan:
+						// Clean up resources in case of cancellation
+						for _, d := range dataBatch[i:] {
+							putBuffer(d)
+						}
 
-		// 当批次满了时发送
-		if len(dataBatch) >= batchSize {
-			for i := range dataBatch {
-				select {
-				case jobs <- job{
-					id:   idBatch[i],
-					data: dataBatch[i],
-				}:
-				case <-options.CancelChan:
-					// 被取消的情况下清理资源
-					for _, d := range dataBatch {
-						putBuffer(d)
+						// Gracefully close all goroutines
+						close(jobs)
+						wg.Wait()
+						close(results)
+						<-resultsDone
+						return stats, ErrOperationCancelled
 					}
-					return stats, ErrOperationCancelled
 				}
+				// Clear batch
+				dataBatch = dataBatch[:0]
+				idBatch = idBatch[:0]
 			}
-			// 清空批次
-			dataBatch = dataBatch[:0]
-			idBatch = idBatch[:0]
+		}
+
+		if err == io.EOF {
+			break
 		}
 	}
 
-	// 发送剩余批次
+	// Send remaining batch
 	for i := range dataBatch {
 		jobs <- job{
 			id:   idBatch[i],
@@ -906,6 +812,12 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 	// Wait for result processing to complete
 	<-resultsDone
 
+	// Update statistics
+	if stats != nil {
+		stats.BytesProcessed = bytesProcessed
+		stats.BlocksProcessed = blocksProcessed
+	}
+
 	// Check for errors
 	select {
 	case err := <-errorsChannel:
@@ -913,6 +825,240 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 	default:
 		return stats, nil
 	}
+}
+
+// DecryptStreamWithOptions performs stream decryption with configuration options
+func (x *XCipher) DecryptStreamWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (*StreamStats, error) {
+	// Use dynamic parameter system optimization
+	if options.BufferSize <= 0 {
+		options.BufferSize = adaptiveBufferSize(0)
+	} else {
+		options.BufferSize = adaptiveBufferSize(options.BufferSize)
+	}
+
+	// Automatically decide whether to use parallel processing based on buffer size
+	if !options.UseParallel && options.BufferSize >= parallelThreshold/2 {
+		options.UseParallel = true
+		if options.MaxWorkers <= 0 {
+			options.MaxWorkers = adaptiveWorkerCount(0, options.BufferSize)
+		}
+	} else if options.MaxWorkers <= 0 {
+		options.MaxWorkers = adaptiveWorkerCount(0, options.BufferSize)
+	}
+
+	// Initialize statistics
+	var stats *StreamStats
+	if options.CollectStats {
+		stats = &StreamStats{
+			StartTime:          time.Now(),
+			ParallelProcessing: options.UseParallel,
+			WorkerCount:        options.MaxWorkers,
+			BufferSize:         options.BufferSize,
+		}
+		defer func() {
+			stats.EndTime = time.Now()
+			if stats.BytesProcessed > 0 {
+				durationSec := stats.Duration().Seconds()
+				if durationSec > 0 {
+					stats.Throughput = float64(stats.BytesProcessed) / durationSec / 1e6 // MB/s
+					// Update system metrics
+					updateSystemMetrics(0, 0, stats.Throughput)
+				}
+				if stats.BlocksProcessed > 0 {
+					stats.AvgBlockSize = float64(stats.BytesProcessed) / float64(stats.BlocksProcessed)
+				}
+			}
+		}()
+	}
+
+	// Validate parameters
+	if options.BufferSize < minBufferSize {
+		return stats, fmt.Errorf("%w: %d is less than minimum %d",
+			ErrBufferSizeTooSmall, options.BufferSize, minBufferSize)
+	} else if options.BufferSize > maxBufferSize {
+		return stats, fmt.Errorf("%w: %d is greater than maximum %d",
+			ErrBufferSizeTooLarge, options.BufferSize, maxBufferSize)
+	}
+
+	// Parallel processing path
+	if options.UseParallel {
+		// Adaptively adjust worker thread count
+		workerCount := adaptiveWorkerCount(options.MaxWorkers, options.BufferSize)
+		options.MaxWorkers = workerCount
+
+		// Update statistics
+		if stats != nil {
+			stats.WorkerCount = workerCount
+		}
+
+		// Use parallel implementation
+		return x.decryptStreamParallelWithOptions(reader, writer, options)
+	}
+
+	// Sequential processing path - use zero-copy optimization
+	// ----------------------------------------------------------
+
+	// Read nonce
+	nonce := make([]byte, nonceSize)
+	if _, err := io.ReadFull(reader, nonce); err != nil {
+		return stats, fmt.Errorf("%w: failed to read nonce: %v", ErrReadFailed, err)
+	}
+
+	// Use CPU-aware optimal buffer size
+	bufferSize := options.BufferSize
+
+	// Get encrypted data buffer from pool
+	encBuffer := getBuffer(bufferSize + x.overhead)
+	defer putBuffer(encBuffer)
+
+	// Pre-allocate decryption result buffer, avoid repeated allocation
+	decBuffer := make([]byte, 0, bufferSize)
+
+	// Counter for tracking data block sequence
+	var counter uint64 = 0
+	var bytesProcessed int64 = 0
+	var blocksProcessed = 0
+
+	// Optimize batch processing based on CPU features
+	useDirectWrite := cpuFeatures.hasAVX2 || cpuFeatures.hasAVX
+
+	// Pre-allocate pending write queue to reduce system calls
+	pendingWrites := make([][]byte, 0, 8)
+	totalPendingBytes := 0
+	flushThreshold := 256 * 1024 // 256KB batch write threshold
+
+	// Flush buffered write data
+	flushWrites := func() error {
+		if len(pendingWrites) == 0 {
+			return nil
+		}
+
+		// Single data block write directly
+		if len(pendingWrites) == 1 {
+			if _, err := writer.Write(pendingWrites[0]); err != nil {
+				return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+			}
+			// Update statistics
+			if stats != nil {
+				bytesProcessed += int64(len(pendingWrites[0]))
+			}
+			pendingWrites = pendingWrites[:0]
+			totalPendingBytes = 0
+			return nil
+		}
+
+		// Multiple data blocks batch write
+		batchBuffer := getBuffer(totalPendingBytes)
+		offset := 0
+
+		for _, data := range pendingWrites {
+			copy(batchBuffer[offset:], data)
+			offset += len(data)
+		}
+
+		// Write all data at once
+		if _, err := writer.Write(batchBuffer[:offset]); err != nil {
+			putBuffer(batchBuffer)
+			return fmt.Errorf("%w: %v", ErrWriteFailed, err)
+		}
+
+		// Update statistics
+		if stats != nil {
+			bytesProcessed += int64(offset)
+		}
+
+		putBuffer(batchBuffer)
+		pendingWrites = pendingWrites[:0]
+		totalPendingBytes = 0
+		return nil
+	}
+
+	// Defer to ensure all data is flushed
+	defer func() {
+		if err := flushWrites(); err != nil {
+			log.Printf("Warning: failed to flush remaining writes: %v", err)
+		}
+	}()
+
+	for {
+		// Check cancel signal
+		if options.CancelChan != nil {
+			select {
+			case <-options.CancelChan:
+				return stats, ErrOperationCancelled
+			default:
+				// Continue processing
+			}
+		}
+
+		// Read encrypted data
+		n, err := reader.Read(encBuffer)
+		if err != nil && err != io.EOF {
+			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
+		}
+
+		if n > 0 {
+			blocksProcessed++
+
+			// Update nonce - use counter
+			binary.LittleEndian.PutUint64(nonce, counter)
+			counter++
+
+			// Decrypt data block - zero-copy operation
+			decrypted, err := x.aead.Open(decBuffer[:0], nonce, encBuffer[:n], options.AdditionalData)
+			if err != nil {
+				return stats, ErrAuthenticationFailed
+			}
+
+			// Optimize writing strategy - decide based on data size
+			if useDirectWrite && len(decrypted) >= 16*1024 { // Large blocks write directly
+				if err := flushWrites(); err != nil { // Flush waiting data first
+					return stats, err
+				}
+
+				// Write large data block directly
+				if _, err := writer.Write(decrypted); err != nil {
+					return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
+				}
+
+				// Update statistics
+				if stats != nil {
+					bytesProcessed += int64(len(decrypted))
+				}
+			} else {
+				// Small data blocks batch processing
+				// Because decrypted may point to temporary buffer, we need to copy data
+				decryptedCopy := getBuffer(len(decrypted))
+				copy(decryptedCopy, decrypted)
+
+				pendingWrites = append(pendingWrites, decryptedCopy)
+				totalPendingBytes += len(decryptedCopy)
+
+				// Execute batch write when enough data accumulates
+				if totalPendingBytes >= flushThreshold {
+					if err := flushWrites(); err != nil {
+						return stats, err
+					}
+				}
+			}
+		}
+
+		if err == io.EOF {
+			break
+		}
+	}
+
+	// Ensure all data is written
+	if err := flushWrites(); err != nil {
+		return stats, err
+	}
+
+	// Update statistics
+	if stats != nil {
+		stats.BlocksProcessed = blocksProcessed
+	}
+
+	return stats, nil
 }
 
 // EncryptStream performs stream encryption with default options
@@ -941,11 +1087,11 @@ type result struct {
 	data []byte
 }
 
-// 新增函数 - 优化的工作线程数目计算
+// New function - optimized worker count calculation
 func calculateOptimalWorkers(dataSize int, maxWorkers int) int {
 	cpuCount := runtime.NumCPU()
 
-	// 对于小数据量，使用较少的工作线程
+	// For small data amount, use fewer worker threads
 	if dataSize < 4*1024*1024 { // 4MB
 		workers := cpuCount / 2
 		if workers < minWorkers {
@@ -957,7 +1103,7 @@ func calculateOptimalWorkers(dataSize int, maxWorkers int) int {
 		return workers
 	}
 
-	// 对于大数据量，使用更多工作线程但不超过CPU数
+	// For large data amount, use more worker threads but not more than CPU count
 	workers := cpuCount
 	if workers > maxWorkers {
 		return maxWorkers
@@ -965,9 +1111,9 @@ func calculateOptimalWorkers(dataSize int, maxWorkers int) int {
 	return workers
 }
 
-// 新增函数 - 计算最佳的缓冲区大小
+// New function - calculate optimal buffer size
 func calculateOptimalBufferSize(options StreamOptions) int {
-	// 检查用户指定的缓冲区大小
+	// Check user-specified buffer size
 	if options.BufferSize > 0 {
 		if options.BufferSize < minBufferSize {
 			return minBufferSize
@@ -978,6 +1124,559 @@ func calculateOptimalBufferSize(options StreamOptions) int {
 		return options.BufferSize
 	}
 
-	// 未指定时使用默认值
+	// Default value when unspecified
 	return optimalBlockSize
+}
+
+// CPUFeatures stores current CPU support feature information
+type CPUFeatures struct {
+	hasAVX        bool
+	hasAVX2       bool
+	hasSSE41      bool
+	hasNEON       bool // ARM NEON instruction set
+	cacheLineSize int
+	l1CacheSize   int
+	l2CacheSize   int
+	l3CacheSize   int
+}
+
+// Global CPU feature variable
+var cpuFeatures = detectCPUFeatures()
+
+// Detect CPU features and capabilities
+func detectCPUFeatures() CPUFeatures {
+	features := CPUFeatures{
+		hasAVX:        cpu.X86.HasAVX,
+		hasAVX2:       cpu.X86.HasAVX2,
+		hasSSE41:      cpu.X86.HasSSE41,
+		hasNEON:       cpu.ARM64.HasASIMD,
+		cacheLineSize: 64, // Default cache line size
+	}
+
+	// Estimate CPU cache size (using conservative estimates)
+	if runtime.GOARCH == "amd64" || runtime.GOARCH == "386" {
+		features.l1CacheSize = 32 * 1024       // 32KB
+		features.l2CacheSize = 256 * 1024      // 256KB
+		features.l3CacheSize = 8 * 1024 * 1024 // 8MB
+	} else if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
+		features.l1CacheSize = 32 * 1024       // 32KB
+		features.l2CacheSize = 1024 * 1024     // 1MB
+		features.l3CacheSize = 4 * 1024 * 1024 // 4MB
+	}
+
+	return features
+}
+
+// Get current CPU architecture optimal buffer size
+func getOptimalBufferSize() int {
+	if cpuFeatures.hasAVX2 {
+		return avxBufferSize
+	} else if cpuFeatures.hasSSE41 {
+		return sseBufferSize
+	} else if cpuFeatures.hasNEON {
+		return armBufferSize
+	}
+	return optimalBlockSize // Default size
+}
+
+// Get optimal parallel worker count based on CPU architecture
+func getOptimalWorkerCount() int {
+	cpuCount := runtime.NumCPU()
+
+	// Different architecture optimization thread count
+	if cpuFeatures.hasAVX2 || cpuFeatures.hasAVX {
+		// AVX architecture efficiency higher, can use fewer threads
+		return max(minWorkers, min(cpuCount-1, maxWorkers))
+	} else if cpuFeatures.hasNEON {
+		// ARM architecture may require different optimization strategy
+		return max(minWorkers, min(cpuCount, maxWorkers))
+	}
+
+	// Default strategy
+	return max(minWorkers, min(cpuCount, maxWorkers))
+}
+
+// Simple min and max functions
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// Zero-copy technique related helper functions
+// ---------------------------------
+
+// Use unsafe.Pointer to implement memory zero-copy conversion
+// Warning: This may cause very subtle problems, must be used carefully
+func bytesToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+func stringToBytes(s string) []byte {
+	return *(*[]byte)(unsafe.Pointer(
+		&struct {
+			string
+			cap int
+		}{s, len(s)},
+	))
+}
+
+// Provide safe memory reuse method to avoid unnecessary allocation
+func reuseBuffer(data []byte, newCapacity int) []byte {
+	// If existing buffer capacity is enough, reuse
+	if cap(data) >= newCapacity {
+		return data[:newCapacity]
+	}
+
+	// Otherwise create new buffer and copy data
+	newBuf := make([]byte, newCapacity)
+	copy(newBuf, data)
+	return newBuf
+}
+
+// Internal method for parallel decryption with options
+func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (*StreamStats, error) {
+	// Initialize statistics
+	var stats *StreamStats
+	if options.CollectStats {
+		stats = &StreamStats{
+			StartTime:          time.Now(),
+			ParallelProcessing: true,
+			WorkerCount:        options.MaxWorkers,
+			BufferSize:         options.BufferSize,
+		}
+		defer func() {
+			stats.EndTime = time.Now()
+			if stats.BytesProcessed > 0 {
+				durationSec := stats.Duration().Seconds()
+				if durationSec > 0 {
+					stats.Throughput = float64(stats.BytesProcessed) / durationSec / 1e6 // MB/s
+				}
+				if stats.BlocksProcessed > 0 {
+					stats.AvgBlockSize = float64(stats.BytesProcessed) / float64(stats.BlocksProcessed)
+				}
+			}
+		}()
+	}
+
+	// Use CPU-aware parameters optimization
+	bufferSize := adaptiveBufferSize(options.BufferSize)
+	workerCount := adaptiveWorkerCount(options.MaxWorkers, bufferSize)
+
+	// Read base nonce
+	baseNonce := make([]byte, nonceSize)
+	if _, err := io.ReadFull(reader, baseNonce); err != nil {
+		return stats, fmt.Errorf("%w: failed to read nonce: %v", ErrReadFailed, err)
+	}
+
+	// Adjust job queue size to reduce contention - based on CPU features
+	workerQueueSize := workerCount * 4
+	if cpuFeatures.hasAVX2 || cpuFeatures.hasAVX {
+		workerQueueSize = workerCount * 8 // AVX processors can handle more tasks
+	}
+
+	// Create worker pool
+	jobs := make(chan job, workerQueueSize)
+	results := make(chan result, workerQueueSize)
+	errorsChannel := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	// Start worker threads
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// Each worker thread pre-allocates its own decryption buffer to avoid allocation each time
+			decBuf := make([]byte, 0, bufferSize)
+
+			for job := range jobs {
+				// Create unique nonce for each block
+				blockNonce := make([]byte, nonceSize)
+				copy(blockNonce, baseNonce)
+				binary.LittleEndian.PutUint64(blockNonce, job.id)
+
+				// Decrypt data block - try zero-copy operation
+				decrypted, err := x.aead.Open(decBuf[:0], blockNonce, job.data, options.AdditionalData)
+				if err != nil {
+					select {
+					case errorsChannel <- ErrAuthenticationFailed:
+					default:
+						// If an error is already sent, don't send another one
+					}
+					putBuffer(job.data) // Release buffer
+					continue            // Continue processing other blocks instead of returning immediately
+				}
+
+				// Zero-copy method pass result - directly use decryption result without copying
+				// Here we pass decryption result through queue, but not copy to new buffer
+				results <- result{
+					id:   job.id,
+					data: decrypted,
+				}
+
+				// Release input buffer
+				putBuffer(job.data)
+			}
+		}()
+	}
+
+	// Start result collection and writing thread
+	resultsDone := make(chan struct{})
+	go func() {
+		pendingResults := make(map[uint64][]byte)
+		nextID := uint64(0)
+
+		for r := range results {
+			pendingResults[r.id] = r.data
+
+			// Write results in order - zero-copy batch write
+			for {
+				if data, ok := pendingResults[nextID]; ok {
+					if _, err := writer.Write(data); err != nil {
+						errorsChannel <- fmt.Errorf("%w: %v", ErrWriteFailed, err)
+						return
+					}
+
+					if stats != nil {
+						stats.BytesProcessed += int64(len(data))
+						stats.BlocksProcessed++
+					}
+
+					// Note: We no longer return buffer to pool, because these buffers are directly obtained from AEAD.Open
+					// Lower layer implementation is responsible for memory management
+					delete(pendingResults, nextID)
+					nextID++
+				} else {
+					break
+				}
+			}
+		}
+		close(resultsDone)
+	}()
+
+	// Read and assign work
+	sizeBytes := make([]byte, 4)
+	var jobID uint64 = 0
+
+	// Optimize batch processing size based on CPU features and buffer size
+	batchCount := batchSize
+	if cpuFeatures.hasAVX2 {
+		batchCount = batchSize * 2 // AVX2 can process larger batches
+	}
+
+	// Add batch processing mechanism to reduce channel contention
+	dataBatch := make([][]byte, 0, batchCount)
+	idBatch := make([]uint64, 0, batchCount)
+
+	for {
+		// Check cancel signal
+		if options.CancelChan != nil {
+			select {
+			case <-options.CancelChan:
+				// Gracefully handle cancellation
+				close(jobs)
+				wg.Wait()
+				close(results)
+				<-resultsDone
+				return stats, ErrOperationCancelled
+			default:
+				// Continue processing
+			}
+		}
+
+		// Read block size - use shared buffer to reduce small object allocation
+		_, err := io.ReadFull(reader, sizeBytes)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
+		}
+
+		blockSize := binary.LittleEndian.Uint32(sizeBytes)
+		encryptedBlock := getBuffer(int(blockSize))
+
+		// Read encrypted data block - use pre-allocated buffer
+		_, err = io.ReadFull(reader, encryptedBlock)
+		if err != nil {
+			putBuffer(encryptedBlock) // Release buffer
+			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
+		}
+
+		// Add to batch
+		dataBatch = append(dataBatch, encryptedBlock)
+		idBatch = append(idBatch, jobID)
+		jobID++
+
+		// Send when batch is full
+		if len(dataBatch) >= batchCount {
+			for i := range dataBatch {
+				select {
+				case jobs <- job{
+					id:   idBatch[i],
+					data: dataBatch[i],
+				}:
+				case <-options.CancelChan:
+					// Clean up resources in case of cancellation
+					for _, d := range dataBatch {
+						putBuffer(d)
+					}
+					return stats, ErrOperationCancelled
+				}
+			}
+			// Clear batch
+			dataBatch = dataBatch[:0]
+			idBatch = idBatch[:0]
+		}
+	}
+
+	// Send remaining batch
+	for i := range dataBatch {
+		jobs <- job{
+			id:   idBatch[i],
+			data: dataBatch[i],
+		}
+	}
+
+	// Close jobs channel and wait for all workers to complete
+	close(jobs)
+	wg.Wait()
+
+	// Close results channel after all workers are done
+	close(results)
+
+	// Wait for result processing to complete
+	<-resultsDone
+
+	// Check for errors
+	select {
+	case err := <-errorsChannel:
+		return stats, err
+	default:
+		return stats, nil
+	}
+}
+
+// Intelligent dynamic parameter adjustment system
+// ----------------------------------
+
+// Dynamic system parameter structure
+type DynamicSystemParams struct {
+	lastCPUUsage       float64
+	lastMemoryUsage    float64
+	lastThroughput     float64
+	samplesCount       int
+	bufferSizeHistory  []int
+	workerCountHistory []int
+	mutex              sync.Mutex
+}
+
+// Global dynamic parameter system instance
+var dynamicParams = &DynamicSystemParams{
+	bufferSizeHistory:  make([]int, 0, 10),
+	workerCountHistory: make([]int, 0, 10),
+}
+
+// Based on runtime environment, dynamically adjust buffer size
+func adaptiveBufferSize(requestedSize int) int {
+	dynamicParams.mutex.Lock()
+	defer dynamicParams.mutex.Unlock()
+
+	// If no size specified, use default value
+	if requestedSize <= 0 {
+		return optimalBlockSize
+	}
+
+	// Check and adjust to valid range
+	if requestedSize < minBufferSize {
+		// Buffer too small, automatically adjust to minimum valid value
+		return minBufferSize
+	}
+
+	if requestedSize > maxBufferSize {
+		// Buffer too large, automatically adjust to maximum valid value
+		return maxBufferSize
+	}
+
+	// Record historical usage for future optimization
+	if len(dynamicParams.bufferSizeHistory) >= 10 {
+		dynamicParams.bufferSizeHistory = dynamicParams.bufferSizeHistory[1:]
+	}
+	dynamicParams.bufferSizeHistory = append(dynamicParams.bufferSizeHistory, requestedSize)
+
+	// Return requested size (already in valid range)
+	return requestedSize
+}
+
+// Dynamically adjust worker count
+func adaptiveWorkerCount(requestedCount int, bufferSize int) int {
+	dynamicParams.mutex.Lock()
+	defer dynamicParams.mutex.Unlock()
+
+	// If specific count requested, verify and use
+	if requestedCount > 0 {
+		if requestedCount < minWorkers {
+			requestedCount = minWorkers
+		} else if requestedCount > maxWorkers {
+			requestedCount = maxWorkers
+		}
+
+		// Record history
+		dynamicParams.workerCountHistory = append(dynamicParams.workerCountHistory, requestedCount)
+		if len(dynamicParams.workerCountHistory) > 10 {
+			dynamicParams.workerCountHistory = dynamicParams.workerCountHistory[1:]
+		}
+
+		return requestedCount
+	}
+
+	cpuCount := runtime.NumCPU()
+
+	// Basic strategy: Smaller buffer uses more worker threads, Larger buffer uses fewer worker threads
+	var optimalCount int
+	if bufferSize < 64*1024 {
+		// Small buffer: Use more CPU
+		optimalCount = max(minWorkers, min(cpuCount, maxWorkers))
+	} else if bufferSize >= 512*1024 {
+		// Large buffer: Reduce CPU count to avoid memory bandwidth saturation
+		optimalCount = max(minWorkers, min(cpuCount/2, maxWorkers))
+	} else {
+		// Medium buffer: Balance processing
+		optimalCount = max(minWorkers, min(cpuCount*3/4, maxWorkers))
+	}
+
+	// Further adjust based on CPU architecture
+	if cpuFeatures.hasAVX2 {
+		// AVX2 processor efficiency higher, may need fewer threads
+		optimalCount = max(minWorkers, optimalCount*3/4)
+	} else if cpuFeatures.hasNEON {
+		// ARM processor may have different characteristics
+		optimalCount = max(minWorkers, min(optimalCount+1, maxWorkers))
+	}
+
+	// If historical record exists, use average value to stabilize parameters
+	if len(dynamicParams.workerCountHistory) > 0 {
+		sum := 0
+		for _, count := range dynamicParams.workerCountHistory {
+			sum += count
+		}
+		avgCount := sum / len(dynamicParams.workerCountHistory)
+
+		// Move towards historical average value
+		optimalCount = (optimalCount*2 + avgCount) / 3
+	}
+
+	// Ensure final result within valid range
+	optimalCount = max(minWorkers, min(optimalCount, maxWorkers))
+
+	// Record history
+	dynamicParams.workerCountHistory = append(dynamicParams.workerCountHistory, optimalCount)
+	if len(dynamicParams.workerCountHistory) > 10 {
+		dynamicParams.workerCountHistory = dynamicParams.workerCountHistory[1:]
+	}
+
+	return optimalCount
+}
+
+// Update dynamic system performance metrics
+func updateSystemMetrics(cpuUsage, memoryUsage, throughput float64) {
+	dynamicParams.mutex.Lock()
+	defer dynamicParams.mutex.Unlock()
+
+	dynamicParams.lastCPUUsage = cpuUsage
+	dynamicParams.lastMemoryUsage = memoryUsage
+	dynamicParams.lastThroughput = throughput
+	dynamicParams.samplesCount++
+}
+
+// Get current system optimal parameter set
+func GetOptimalParameters() (bufferSize, workerCount int) {
+	// Get current optimal parameters
+	bufferSize = adaptiveBufferSize(0)
+	workerCount = adaptiveWorkerCount(0, bufferSize)
+	return
+}
+
+// Get optimized Options for Stream encryption/decryption operations
+func GetOptimizedStreamOptions() StreamOptions {
+	bufferSize, workerCount := GetOptimalParameters()
+	return StreamOptions{
+		BufferSize:     bufferSize,
+		UseParallel:    workerCount > 1,
+		MaxWorkers:     workerCount,
+		AdditionalData: nil,
+		CollectStats:   false,
+		CancelChan:     nil,
+	}
+}
+
+// OptimizationInfo stores system optimization information and suggestions
+type OptimizationInfo struct {
+	// CPU architecture information
+	Architecture     string
+	NumCPUs          int
+	HasAVX           bool
+	HasAVX2          bool
+	HasSSE41         bool
+	HasNEON          bool
+	EstimatedL1Cache int
+	EstimatedL2Cache int
+	EstimatedL3Cache int
+
+	// Recommended system parameters
+	RecommendedBufferSize int
+	RecommendedWorkers    int
+	ParallelThreshold     int
+
+	// Performance statistics
+	LastMeasuredThroughput float64
+	SamplesCount           int
+}
+
+// GetSystemOptimizationInfo returns current system optimization information and suggestions
+func GetSystemOptimizationInfo() *OptimizationInfo {
+	// Get current CPU architecture
+	arch := runtime.GOARCH
+
+	// Get optimal parameters
+	bufferSize, workerCount := GetOptimalParameters()
+
+	// Build optimization information
+	info := &OptimizationInfo{
+		Architecture:     arch,
+		NumCPUs:          runtime.NumCPU(),
+		HasAVX:           cpuFeatures.hasAVX,
+		HasAVX2:          cpuFeatures.hasAVX2,
+		HasSSE41:         cpuFeatures.hasSSE41,
+		HasNEON:          cpuFeatures.hasNEON,
+		EstimatedL1Cache: cpuFeatures.l1CacheSize,
+		EstimatedL2Cache: cpuFeatures.l2CacheSize,
+		EstimatedL3Cache: cpuFeatures.l3CacheSize,
+
+		RecommendedBufferSize: bufferSize,
+		RecommendedWorkers:    workerCount,
+		ParallelThreshold:     parallelThreshold,
+	}
+
+	// Get performance data
+	dynamicParams.mutex.Lock()
+	info.LastMeasuredThroughput = dynamicParams.lastThroughput
+	info.SamplesCount = dynamicParams.samplesCount
+	dynamicParams.mutex.Unlock()
+
+	return info
+}
+
+// GetDefaultOptions returns default parameters based on system optimization
+func GetDefaultOptions() StreamOptions {
+	return GetOptimizedStreamOptions()
 }

@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// genRandomDataForBench 生成指定大小的随机数据（基准测试专用）
+// genRandomDataForBench generates random data of specified size (for benchmarks only)
 func genRandomDataForBench(size int) []byte {
 	data := make([]byte, size)
 	if _, err := rand.Read(data); err != nil {
@@ -35,7 +35,7 @@ func createBenchTempFile(b *testing.B, data []byte) string {
 	return tempFile.Name()
 }
 
-// BenchmarkEncrypt 测试不同大小数据的加密性能
+// BenchmarkEncrypt tests encryption performance for different data sizes
 func BenchmarkEncrypt(b *testing.B) {
 	sizes := []int{
 		1 * 1024,        // 1KB
@@ -63,7 +63,7 @@ func BenchmarkEncrypt(b *testing.B) {
 	}
 }
 
-// BenchmarkDecrypt 测试不同大小数据的解密性能
+// BenchmarkDecrypt tests decryption performance for different data sizes
 func BenchmarkDecrypt(b *testing.B) {
 	sizes := []int{
 		1 * 1024,        // 1KB
@@ -441,7 +441,7 @@ func BenchmarkStreamFileVsMemory(b *testing.B) {
 	}
 }
 
-// 生成固定的测试密钥
+// Generate fixed test key
 func generateBenchTestKey() []byte {
 	key := make([]byte, chacha20poly1305.KeySize)
 	if _, err := rand.Read(key); err != nil {
@@ -450,14 +450,14 @@ func generateBenchTestKey() []byte {
 	return key
 }
 
-var benchTestKey = generateBenchTestKey() // 使用固定密钥以减少测试变量
+var benchTestKey = generateBenchTestKey() // Use fixed key to reduce test variables
 
-// BenchmarkEncryptStream 测试流式加密的性能
+// BenchmarkEncryptStream tests stream encryption performance
 func BenchmarkEncryptStream(b *testing.B) {
 	sizes := []int{
 		1 * 1024 * 1024,  // 1MB
 		16 * 1024 * 1024, // 16MB
-		64 * 1024 * 1024, // 64MB - 对于大文件的表现
+		64 * 1024 * 1024, // 64MB - performance for large files
 	}
 
 	for _, size := range sizes {
@@ -483,12 +483,12 @@ func BenchmarkEncryptStream(b *testing.B) {
 	}
 }
 
-// BenchmarkEncryptStreamParallel 测试并行流式加密的性能
+// BenchmarkEncryptStreamParallel tests parallel stream encryption performance
 func BenchmarkEncryptStreamParallel(b *testing.B) {
 	sizes := []int{
 		1 * 1024 * 1024,  // 1MB
 		16 * 1024 * 1024, // 16MB
-		64 * 1024 * 1024, // 64MB - 对于大文件的表现
+		64 * 1024 * 1024, // 64MB - performance for large files
 	}
 
 	for _, size := range sizes {
@@ -517,7 +517,7 @@ func BenchmarkEncryptStreamParallel(b *testing.B) {
 	}
 }
 
-// BenchmarkDecryptStream 测试流式解密的性能
+// BenchmarkDecryptStream tests stream decryption performance
 func BenchmarkDecryptStream(b *testing.B) {
 	sizes := []int{
 		1 * 1024 * 1024,  // 1MB
@@ -526,7 +526,7 @@ func BenchmarkDecryptStream(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(byteCountToString(int64(size)), func(b *testing.B) {
-			// 先加密数据
+			// Encrypt data first
 			data := genRandomDataForBench(size)
 			cipher := NewXCipher(benchTestKey)
 			encBuf := &bytes.Buffer{}
@@ -542,7 +542,7 @@ func BenchmarkDecryptStream(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				r := bytes.NewReader(encData)
-				w := io.Discard // 使用Discard避免缓冲区分配和写入的开销
+				w := io.Discard // Use Discard to avoid buffer allocation and write overhead
 				b.StartTimer()
 
 				err := cipher.DecryptStream(r, w, nil)
@@ -554,7 +554,7 @@ func BenchmarkDecryptStream(b *testing.B) {
 	}
 }
 
-// BenchmarkDecryptStreamParallel 测试并行流式解密的性能
+// BenchmarkDecryptStreamParallel tests parallel stream decryption performance
 func BenchmarkDecryptStreamParallel(b *testing.B) {
 	sizes := []int{
 		1 * 1024 * 1024,  // 1MB
@@ -563,7 +563,7 @@ func BenchmarkDecryptStreamParallel(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(byteCountToString(int64(size)), func(b *testing.B) {
-			// 先用并行模式加密数据
+			// Encrypt data using parallel mode first
 			data := genRandomDataForBench(size)
 			cipher := NewXCipher(benchTestKey)
 			encBuf := &bytes.Buffer{}
@@ -576,7 +576,7 @@ func BenchmarkDecryptStreamParallel(b *testing.B) {
 			}
 			encData := encBuf.Bytes()
 
-			// 解密测试
+			// Decryption test
 			decOptions := DefaultStreamOptions()
 			decOptions.UseParallel = true
 
@@ -586,7 +586,7 @@ func BenchmarkDecryptStreamParallel(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				b.StopTimer()
 				r := bytes.NewReader(encData)
-				w := io.Discard // 使用Discard避免缓冲区分配和写入的开销
+				w := io.Discard // Use Discard to avoid buffer allocation and write overhead
 				b.StartTimer()
 
 				_, err := cipher.DecryptStreamWithOptions(r, w, decOptions)
@@ -598,7 +598,7 @@ func BenchmarkDecryptStreamParallel(b *testing.B) {
 	}
 }
 
-// byteCountToString 将字节数转换为人类可读的字符串
+// byteCountToString converts byte count to human-readable string
 func byteCountToString(b int64) string {
 	const unit = 1024
 	if b < unit {
@@ -610,4 +610,256 @@ func byteCountToString(b int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// BenchmarkZeroCopyVsCopy compares performance of zero-copy and standard copy methods
+func BenchmarkZeroCopyVsCopy(b *testing.B) {
+	// Prepare original data
+	data := genRandomDataForBench(1024 * 1024) // 1MB data
+
+	// Test string conversion performance
+	b.Run("BytesToString_ZeroCopy", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			s := bytesToString(data)
+			_ = len(s) // Prevent compiler optimization
+		}
+	})
+
+	b.Run("BytesToString_StandardCopy", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			s := string(data)
+			_ = len(s) // Prevent compiler optimization
+		}
+	})
+
+	// Test buffer reuse performance
+	b.Run("BufferReuse", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			// Get buffer
+			buffer := getBuffer(64 * 1024)
+			// Simulate buffer usage
+			copy(buffer, data[:64*1024])
+			// Release buffer
+			putBuffer(buffer)
+		}
+	})
+
+	b.Run("BufferAllocate", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			// Allocate new buffer each time
+			buffer := make([]byte, 64*1024)
+			// Simulate buffer usage
+			copy(buffer, data[:64*1024])
+			// GC will handle release
+		}
+	})
+}
+
+// BenchmarkAdaptiveParameters tests dynamic parameter adjustment system performance
+func BenchmarkAdaptiveParameters(b *testing.B) {
+	// Generate test data
+	sizes := []int{
+		64 * 1024,       // 64KB
+		1 * 1024 * 1024, // 1MB
+		8 * 1024 * 1024, // 8MB
+	}
+
+	for _, size := range sizes {
+		b.Run(fmt.Sprintf("Size_%s", byteCountToString(int64(size))), func(b *testing.B) {
+			data := genRandomDataForBench(size)
+			key := make([]byte, chacha20poly1305.KeySize)
+			rand.Read(key)
+			x := NewXCipher(key)
+
+			// Test with adaptive parameters
+			b.Run("AdaptiveParams", func(b *testing.B) {
+				b.ResetTimer()
+				b.SetBytes(int64(size))
+
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					reader := bytes.NewReader(data)
+					writer := ioutil.Discard
+
+					// Use optimized options
+					options := GetOptimizedStreamOptions()
+					options.CollectStats = false
+
+					b.StartTimer()
+
+					_, _ = x.EncryptStreamWithOptions(reader, writer, options)
+				}
+			})
+
+			// Test with fixed parameters
+			b.Run("FixedParams", func(b *testing.B) {
+				b.ResetTimer()
+				b.SetBytes(int64(size))
+
+				for i := 0; i < b.N; i++ {
+					b.StopTimer()
+					reader := bytes.NewReader(data)
+					writer := ioutil.Discard
+
+					// Use fixed standard options
+					options := DefaultStreamOptions()
+
+					b.StartTimer()
+
+					_, _ = x.EncryptStreamWithOptions(reader, writer, options)
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkCPUArchitectureOptimization tests optimizations for different CPU architectures
+func BenchmarkCPUArchitectureOptimization(b *testing.B) {
+	// Get CPU optimization info
+	info := GetSystemOptimizationInfo()
+
+	// Log CPU architecture information
+	b.Logf("Benchmark running on %s architecture", info.Architecture)
+	b.Logf("CPU features: AVX=%v, AVX2=%v, SSE41=%v, NEON=%v",
+		info.HasAVX, info.HasAVX2, info.HasSSE41, info.HasNEON)
+
+	// Prepare test data
+	dataSize := 10 * 1024 * 1024 // 10MB
+	data := genRandomDataForBench(dataSize)
+
+	// Create temporary file
+	tempFile := createBenchTempFile(b, data)
+	defer os.Remove(tempFile)
+
+	// Define different buffer sizes
+	bufferSizes := []int{
+		16 * 1024,  // 16KB
+		64 * 1024,  // 64KB (default)
+		128 * 1024, // 128KB (AVX optimized size)
+		256 * 1024, // 256KB
+	}
+
+	key := make([]byte, chacha20poly1305.KeySize)
+	rand.Read(key)
+	x := NewXCipher(key)
+
+	for _, bufSize := range bufferSizes {
+		name := fmt.Sprintf("BufferSize_%dKB", bufSize/1024)
+
+		// Add indication if this is architecture-optimized size
+		if (info.HasAVX2 && bufSize == avxBufferSize) ||
+			(info.HasSSE41 && !info.HasAVX2 && bufSize == sseBufferSize) ||
+			(info.HasNEON && bufSize == armBufferSize) {
+			name += "_ArchOptimized"
+		}
+
+		b.Run(name, func(b *testing.B) {
+			b.SetBytes(int64(dataSize))
+
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				// Open input file
+				inFile, err := os.Open(tempFile)
+				if err != nil {
+					b.Fatalf("Failed to open test file: %v", err)
+				}
+
+				// Set options
+				options := DefaultStreamOptions()
+				options.BufferSize = bufSize
+				options.UseParallel = true
+				// Use dynamic worker thread count
+				options.MaxWorkers = adaptiveWorkerCount(0, bufSize)
+
+				b.StartTimer()
+
+				// Perform encryption
+				_, err = x.EncryptStreamWithOptions(inFile, ioutil.Discard, options)
+				if err != nil {
+					b.Fatalf("Encryption failed: %v", err)
+				}
+
+				b.StopTimer()
+				inFile.Close()
+			}
+		})
+	}
+}
+
+// BenchmarkStreamPerformanceMatrix tests performance matrix with different parameter combinations
+func BenchmarkStreamPerformanceMatrix(b *testing.B) {
+	// Prepare test data
+	dataSize := 5 * 1024 * 1024 // 5MB
+	data := genRandomDataForBench(dataSize)
+
+	// Create temporary file
+	tempFile := createBenchTempFile(b, data)
+	defer os.Remove(tempFile)
+
+	// Parameter matrix test
+	testCases := []struct {
+		name        string
+		useAdaptive bool // Whether to use adaptive parameters
+		useParallel bool // Whether to use parallel processing
+		zeroCopy    bool // Whether to use zero-copy optimization
+		bufferSize  int  // Buffer size, 0 means auto-select
+	}{
+		{"FullyOptimized", true, true, true, 0},
+		{"AdaptiveParams", true, true, false, 0},
+		{"ParallelOnly", false, true, false, 64 * 1024},
+		{"ZeroCopyOnly", false, false, true, 64 * 1024},
+		{"BasicProcessing", false, false, false, 64 * 1024},
+	}
+
+	key := make([]byte, chacha20poly1305.KeySize)
+	rand.Read(key)
+	x := NewXCipher(key)
+
+	for _, tc := range testCases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.SetBytes(int64(dataSize))
+
+			for i := 0; i < b.N; i++ {
+				b.StopTimer()
+				// Open input file
+				inFile, err := os.Open(tempFile)
+				if err != nil {
+					b.Fatalf("Failed to open test file: %v", err)
+				}
+
+				// Configure options
+				var options StreamOptions
+				if tc.useAdaptive {
+					options = GetOptimizedStreamOptions()
+				} else {
+					options = DefaultStreamOptions()
+					options.UseParallel = tc.useParallel
+					options.BufferSize = tc.bufferSize
+				}
+
+				b.StartTimer()
+
+				// Perform encryption
+				stats, err := x.EncryptStreamWithOptions(inFile, ioutil.Discard, options)
+				if err != nil {
+					b.Fatalf("Encryption failed: %v", err)
+				}
+
+				b.StopTimer()
+				inFile.Close()
+
+				// Check if stats is not nil before logging
+				if i == 0 && stats != nil {
+					// Log parameter information
+					b.Logf("Parameters: Parallel=%v, Buffer=%dKB, Workers=%d",
+						stats.ParallelProcessing, stats.BufferSize/1024, stats.WorkerCount)
+
+					// Only print throughput if it's been calculated
+					if stats.Throughput > 0 {
+						b.Logf("Performance: Throughput=%.2f MB/s", stats.Throughput)
+					}
+				}
+			}
+		})
+	}
 }
