@@ -1,6 +1,6 @@
 module github.com/landaiqing/go-xcipher
 
-go 1.24.0
+go 1.24
 
 require golang.org/x/crypto v0.36.0
 
