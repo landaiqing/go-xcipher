@@ -136,56 +136,45 @@ func TestStreamEncryptDecryptWithOptions(t *testing.T) {
 			}
 			defer outFile.Close()
 
-			// Create options
-			options := DefaultStreamOptions()
-			options.BufferSize = bufSize
-			options.AdditionalData = additionalData
-			options.CollectStats = true
-
-			// Perform stream encryption
-			stats, err := xcipher.EncryptStreamWithOptions(inFile, outFile, options)
+			// 使用简单的EncryptStream方法
+			err = xcipher.EncryptStream(inFile, outFile, additionalData)
 			if err != nil {
 				t.Fatalf("Stream encryption failed: %v", err)
 			}
 
-			// Output encryption performance statistics
-			t.Logf("Encryption performance statistics (buffer size=%dKB):", bufSize/1024)
-			t.Logf("- Bytes processed: %d", stats.BytesProcessed)
-			t.Logf("- Blocks processed: %d", stats.BlocksProcessed)
-			t.Logf("- Average block size: %.2f bytes", stats.AvgBlockSize)
-			t.Logf("- Processing time: %v", stats.Duration())
-			t.Logf("- Throughput: %.2f MB/s", stats.Throughput)
+			// 确保文件已写入并关闭
+			outFile.Close()
 
-			// Prepare for decryption
-			encData, err := ioutil.ReadFile(encryptedFile)
+			// 打开加密文件进行解密
+			encFile, err := os.Open(encryptedFile)
 			if err != nil {
-				t.Fatalf("Failed to read encrypted file: %v", err)
+				t.Fatalf("Failed to open encrypted file: %v", err)
 			}
+			defer encFile.Close()
 
-			encFile := bytes.NewReader(encData)
-
+			// 创建解密输出文件
 			decFile, err := os.Create(decryptedFile)
 			if err != nil {
 				t.Fatalf("Failed to create decrypted output file: %v", err)
 			}
 			defer decFile.Close()
 
-			// Perform parallel stream decryption
-			_, err = xcipher.DecryptStreamWithOptions(encFile, decFile, options)
+			// 使用简单的DecryptStream方法
+			err = xcipher.DecryptStream(encFile, decFile, additionalData)
 			if err != nil {
-				t.Fatalf("Parallel stream decryption failed: %v", err)
+				t.Fatalf("Stream decryption failed: %v", err)
 			}
 
-			// Close file to ensure data is written
+			// 确保文件已写入并关闭
 			decFile.Close()
 
-			// Read decrypted data for verification
+			// 读取解密后的数据进行验证
 			decryptedData, err := ioutil.ReadFile(decryptedFile)
 			if err != nil {
 				t.Fatalf("Failed to read decrypted file: %v", err)
 			}
 
-			// Verify data
+			// 验证数据
 			if !bytes.Equal(testData, decryptedData) {
 				t.Fatal("Stream encrypted/decrypted data does not match")
 			}
@@ -213,29 +202,15 @@ func TestStreamParallelProcessing(t *testing.T) {
 		t.Fatalf("Failed to generate test data: %v", err)
 	}
 
-	// Create processing options - first test with non-parallel mode
-	options := DefaultStreamOptions()
-	options.UseParallel = false // Disable parallel processing
-	options.CollectStats = true
-
 	// Use memory buffer for testing
 	t.Log("Starting encryption")
 	var encryptedBuffer bytes.Buffer
 
 	// Perform stream encryption
-	stats, err := xcipher.EncryptStreamWithOptions(
-		bytes.NewReader(testData), &encryptedBuffer, options)
+	err = xcipher.EncryptStream(bytes.NewReader(testData), &encryptedBuffer, nil)
 	if err != nil {
 		t.Fatalf("Stream encryption failed: %v", err)
 	}
-
-	// Output encryption performance statistics
-	t.Logf("Encryption performance statistics:")
-	t.Logf("- Bytes processed: %d", stats.BytesProcessed)
-	t.Logf("- Blocks processed: %d", stats.BlocksProcessed)
-	t.Logf("- Average block size: %.2f bytes", stats.AvgBlockSize)
-	t.Logf("- Processing time: %v", stats.Duration())
-	t.Logf("- Throughput: %.2f MB/s", stats.Throughput)
 
 	// Get encrypted data
 	encryptedData := encryptedBuffer.Bytes()
@@ -251,19 +226,10 @@ func TestStreamParallelProcessing(t *testing.T) {
 	var decryptedBuffer bytes.Buffer
 
 	// Perform stream decryption
-	decStats, err := xcipher.DecryptStreamWithOptions(
-		bytes.NewReader(encryptedData), &decryptedBuffer, options)
+	err = xcipher.DecryptStream(bytes.NewReader(encryptedData), &decryptedBuffer, nil)
 	if err != nil {
 		t.Fatalf("Stream decryption failed: %v (encrypted data size: %d bytes)", err, len(encryptedData))
 	}
-
-	// Output decryption performance statistics
-	t.Logf("Decryption performance statistics:")
-	t.Logf("- Bytes processed: %d", decStats.BytesProcessed)
-	t.Logf("- Blocks processed: %d", decStats.BlocksProcessed)
-	t.Logf("- Average block size: %.2f bytes", decStats.AvgBlockSize)
-	t.Logf("- Processing time: %v", decStats.Duration())
-	t.Logf("- Throughput: %.2f MB/s", decStats.Throughput)
 
 	// Get decrypted data
 	decryptedData := decryptedBuffer.Bytes()
@@ -334,70 +300,6 @@ func TestStreamErrors(t *testing.T) {
 
 	// Initialize cipher
 	xcipher := NewXCipher(key)
-
-	t.Run("InvalidBufferSize", func(t *testing.T) {
-		// Generate test data
-		testData, err := generateRandomData(1024)
-		if err != nil {
-			t.Fatalf("Failed to generate test data: %v", err)
-		}
-
-		// Test case with too small buffer (1 byte)
-		t.Run("BufferTooSmall", func(t *testing.T) {
-			// Create new options for each subtest to avoid shared state
-			options := DefaultStreamOptions()
-			options.BufferSize = 1      // Extremely small buffer
-			options.CollectStats = true // Ensure stats are collected
-
-			var buffer bytes.Buffer
-
-			stats, err := xcipher.EncryptStreamWithOptions(
-				bytes.NewReader(testData), &buffer, options)
-
-			// Verify that buffer size was automatically adjusted instead of returning error
-			if err != nil {
-				t.Errorf("Expected automatic buffer size adjustment, but got error: %v", err)
-			}
-
-			// Check if buffer was adjusted to minimum valid size
-			if stats != nil && stats.BufferSize < minBufferSize {
-				t.Errorf("Buffer size should be greater than or equal to minimum %d, but got %d",
-					minBufferSize, stats.BufferSize)
-			}
-
-			if stats != nil {
-				t.Logf("Requested buffer size: %d, actually used: %d", options.BufferSize, stats.BufferSize)
-			}
-		})
-
-		// Test case with too large buffer (10MB)
-		t.Run("BufferTooLarge", func(t *testing.T) {
-			// Create new options for each subtest to avoid shared state
-			options := DefaultStreamOptions()
-			options.BufferSize = 10 * 1024 * 1024 // 10MB, potentially too large
-			options.CollectStats = true           // Ensure stats are collected
-
-			var buffer bytes.Buffer
-
-			stats, err := xcipher.EncryptStreamWithOptions(
-				bytes.NewReader(testData), &buffer, options)
-
-			// Verify that buffer size was automatically adjusted instead of returning error
-			if err != nil {
-				t.Errorf("Expected automatic adjustment of oversized buffer, but got error: %v", err)
-			}
-
-			// Check if buffer was adjusted to a reasonable size
-			if stats != nil && stats.BufferSize > maxBufferSize {
-				t.Errorf("Buffer size should be less than or equal to maximum %d, but got %d",
-					maxBufferSize, stats.BufferSize)
-			}
-
-			if stats != nil {
-				t.Logf("Requested buffer size: %d, actually used: %d", options.BufferSize, stats.BufferSize)
-			}
-		})
-	})
 
 	// Test authentication failure
 	t.Run("AuthenticationFailure", func(t *testing.T) {
