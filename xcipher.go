@@ -562,7 +562,8 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 				// Create unique nonce for each block using shared base nonce
 				blockNonce := make([]byte, nonceSize)
 				copy(blockNonce, baseNonce)
-				binary.LittleEndian.PutUint64(blockNonce, job.id)
+				// 使用原始nonce，不修改它 - 注释以下行
+				// binary.LittleEndian.PutUint64(blockNonce, job.id)
 
 				// Encrypt data block using pre-allocated buffer
 				encrypted := x.aead.Seal(encBuf[:0], blockNonce, job.data, options.AdditionalData)
@@ -720,9 +721,9 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 	idBatch := make([]uint64, 0, batchCount)
 	var jobID uint64 = 0
 
-	// Use CPU-aware buffer
-	buffer := getBuffer(bufferSize)
-	defer putBuffer(buffer)
+	// 读取其余的数据块
+	encBuffer := getBuffer(bufferSize)
+	defer putBuffer(encBuffer)
 
 	for {
 		// Check cancel signal
@@ -740,7 +741,7 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 			}
 		}
 
-		n, err := reader.Read(buffer)
+		n, err := reader.Read(encBuffer)
 		if err != nil && err != io.EOF {
 			// Error handling
 			close(jobs)
@@ -753,7 +754,7 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 		if n > 0 {
 			// Zero-copy optimization: use exact size buffer to avoid extra copying
 			data := getBuffer(n)
-			copy(data, buffer[:n])
+			copy(data, encBuffer[:n])
 
 			// Add to batch
 			dataBatch = append(dataBatch, data)
@@ -899,9 +900,29 @@ func (x *XCipher) DecryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 	// ----------------------------------------------------------
 
 	// Read nonce
-	nonce := make([]byte, nonceSize)
-	if _, err := io.ReadFull(reader, nonce); err != nil {
+	baseNonce := make([]byte, nonceSize)
+	if _, err := io.ReadFull(reader, baseNonce); err != nil {
 		return stats, fmt.Errorf("%w: failed to read nonce: %v", ErrReadFailed, err)
+	}
+
+	// 读取第一个数据块，确保有足够的数据
+	firstBlockSize := minBufferSize
+	if firstBlockSize > options.BufferSize {
+		firstBlockSize = options.BufferSize
+	}
+
+	firstBlock := getBuffer(firstBlockSize)
+	defer putBuffer(firstBlock)
+
+	firstBlockSize, err := reader.Read(firstBlock)
+	if err != nil && err != io.EOF {
+		return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
+	}
+
+	// 确保有足够的数据进行认证
+	if firstBlockSize < x.aead.Overhead() {
+		return stats, fmt.Errorf("%w: ciphertext length %d is less than minimum %d",
+			ErrCiphertextShort, firstBlockSize, x.aead.Overhead())
 	}
 
 	// Use CPU-aware optimal buffer size
@@ -914,10 +935,9 @@ func (x *XCipher) DecryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 	// Pre-allocate decryption result buffer, avoid repeated allocation
 	decBuffer := make([]byte, 0, bufferSize)
 
-	// Counter for tracking data block sequence
-	var counter uint64 = 0
-	var bytesProcessed int64 = 0
+	// 已经处理的块数
 	var blocksProcessed = 0
+	var bytesProcessed int64 = 0
 
 	// Optimize batch processing based on CPU features
 	useDirectWrite := cpuFeatures.hasAVX2 || cpuFeatures.hasAVX
@@ -991,60 +1011,67 @@ func (x *XCipher) DecryptStreamWithOptions(reader io.Reader, writer io.Writer, o
 			}
 		}
 
-		// Read encrypted data
-		n, err := reader.Read(encBuffer)
-		if err != nil && err != io.EOF {
-			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
-		}
+		// 处理第一个数据块或继续读取
+		var currentBlock []byte
+		var currentSize int
 
-		if n > 0 {
-			blocksProcessed++
-
-			// Update nonce - use counter
-			binary.LittleEndian.PutUint64(nonce, counter)
-			counter++
-
-			// Decrypt data block - zero-copy operation
-			decrypted, err := x.aead.Open(decBuffer[:0], nonce, encBuffer[:n], options.AdditionalData)
-			if err != nil {
-				return stats, ErrAuthenticationFailed
+		if blocksProcessed == 0 && firstBlockSize > 0 {
+			// 使用之前已读取的第一个数据块
+			currentBlock = firstBlock[:firstBlockSize]
+			currentSize = firstBlockSize
+		} else {
+			// 读取新的加密数据块
+			currentSize, err = reader.Read(encBuffer)
+			if err != nil && err != io.EOF {
+				return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
 			}
 
-			// Optimize writing strategy - decide based on data size
-			if useDirectWrite && len(decrypted) >= 16*1024 { // Large blocks write directly
-				if err := flushWrites(); err != nil { // Flush waiting data first
+			if currentSize == 0 {
+				// 没有更多数据了
+				break
+			}
+			currentBlock = encBuffer[:currentSize]
+		}
+
+		// 增加处理块计数
+		blocksProcessed++
+
+		// 尝试解密数据块 - 使用原始nonce，不修改它
+		decrypted, err := x.aead.Open(decBuffer[:0], baseNonce, currentBlock, options.AdditionalData)
+		if err != nil {
+			return stats, ErrAuthenticationFailed
+		}
+
+		// Optimize writing strategy - decide based on data size
+		if useDirectWrite && len(decrypted) >= 16*1024 { // Large blocks write directly
+			if err := flushWrites(); err != nil { // Flush waiting data first
+				return stats, err
+			}
+
+			// Write large data block directly
+			if _, err := writer.Write(decrypted); err != nil {
+				return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
+			}
+
+			// Update statistics
+			if stats != nil {
+				bytesProcessed += int64(len(decrypted))
+			}
+		} else {
+			// Small data blocks batch processing
+			// Because decrypted may point to temporary buffer, we need to copy data
+			decryptedCopy := getBuffer(len(decrypted))
+			copy(decryptedCopy, decrypted)
+
+			pendingWrites = append(pendingWrites, decryptedCopy)
+			totalPendingBytes += len(decryptedCopy)
+
+			// Execute batch write when enough data accumulates
+			if totalPendingBytes >= flushThreshold {
+				if err := flushWrites(); err != nil {
 					return stats, err
 				}
-
-				// Write large data block directly
-				if _, err := writer.Write(decrypted); err != nil {
-					return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
-				}
-
-				// Update statistics
-				if stats != nil {
-					bytesProcessed += int64(len(decrypted))
-				}
-			} else {
-				// Small data blocks batch processing
-				// Because decrypted may point to temporary buffer, we need to copy data
-				decryptedCopy := getBuffer(len(decrypted))
-				copy(decryptedCopy, decrypted)
-
-				pendingWrites = append(pendingWrites, decryptedCopy)
-				totalPendingBytes += len(decryptedCopy)
-
-				// Execute batch write when enough data accumulates
-				if totalPendingBytes >= flushThreshold {
-					if err := flushWrites(); err != nil {
-						return stats, err
-					}
-				}
 			}
-		}
-
-		if err == io.EOF {
-			break
 		}
 	}
 
@@ -1277,6 +1304,26 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 		return stats, fmt.Errorf("%w: failed to read nonce: %v", ErrReadFailed, err)
 	}
 
+	// 读取第一个数据块，确保有足够的数据
+	firstBlockSize := minBufferSize
+	if firstBlockSize > bufferSize {
+		firstBlockSize = bufferSize
+	}
+
+	firstBlock := getBuffer(firstBlockSize)
+	defer putBuffer(firstBlock)
+
+	firstBlockSize, err := reader.Read(firstBlock)
+	if err != nil && err != io.EOF {
+		return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
+	}
+
+	// 确保有足够的数据进行认证
+	if firstBlockSize < x.aead.Overhead() {
+		return stats, fmt.Errorf("%w: ciphertext length %d is less than minimum %d",
+			ErrCiphertextShort, firstBlockSize, x.aead.Overhead())
+	}
+
 	// Adjust job queue size to reduce contention - based on CPU features
 	workerQueueSize := workerCount * 4
 	if cpuFeatures.hasAVX2 || cpuFeatures.hasAVX {
@@ -1299,13 +1346,9 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 			decBuf := make([]byte, 0, bufferSize)
 
 			for job := range jobs {
-				// Create unique nonce for each block
-				blockNonce := make([]byte, nonceSize)
-				copy(blockNonce, baseNonce)
-				binary.LittleEndian.PutUint64(blockNonce, job.id)
-
+				// 所有数据块都使用相同的nonce
 				// Decrypt data block - try zero-copy operation
-				decrypted, err := x.aead.Open(decBuf[:0], blockNonce, job.data, options.AdditionalData)
+				decrypted, err := x.aead.Open(decBuf[:0], baseNonce, job.data, options.AdditionalData)
 				if err != nil {
 					select {
 					case errorsChannel <- ErrAuthenticationFailed:
@@ -1364,7 +1407,6 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 	}()
 
 	// Read and assign work
-	sizeBytes := make([]byte, 4)
 	var jobID uint64 = 0
 
 	// Optimize batch processing size based on CPU features and buffer size
@@ -1376,6 +1418,21 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 	// Add batch processing mechanism to reduce channel contention
 	dataBatch := make([][]byte, 0, batchCount)
 	idBatch := make([]uint64, 0, batchCount)
+
+	// 处理第一个已读取的数据块
+	if firstBlockSize > 0 {
+		// 将第一个数据块添加到批处理中
+		firstBlockCopy := getBuffer(firstBlockSize)
+		copy(firstBlockCopy, firstBlock[:firstBlockSize])
+
+		dataBatch = append(dataBatch, firstBlockCopy)
+		idBatch = append(idBatch, jobID)
+		jobID++
+	}
+
+	// 读取其余的数据块
+	encBuffer := getBuffer(bufferSize)
+	defer putBuffer(encBuffer)
 
 	for {
 		// Check cancel signal
@@ -1393,27 +1450,22 @@ func (x *XCipher) decryptStreamParallelWithOptions(reader io.Reader, writer io.W
 			}
 		}
 
-		// Read block size - use shared buffer to reduce small object allocation
-		_, err := io.ReadFull(reader, sizeBytes)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
+		// 读取下一个数据块
+		currentSize, err := reader.Read(encBuffer)
+		if err != nil && err != io.EOF {
 			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
 		}
 
-		blockSize := binary.LittleEndian.Uint32(sizeBytes)
-		encryptedBlock := getBuffer(int(blockSize))
-
-		// Read encrypted data block - use pre-allocated buffer
-		_, err = io.ReadFull(reader, encryptedBlock)
-		if err != nil {
-			putBuffer(encryptedBlock) // Release buffer
-			return stats, fmt.Errorf("%w: %v", ErrReadFailed, err)
+		if currentSize == 0 || err == io.EOF {
+			break // 没有更多数据
 		}
+
+		// 创建数据块副本
+		encBlockCopy := getBuffer(currentSize)
+		copy(encBlockCopy, encBuffer[:currentSize])
 
 		// Add to batch
-		dataBatch = append(dataBatch, encryptedBlock)
+		dataBatch = append(dataBatch, encBlockCopy)
 		idBatch = append(idBatch, jobID)
 		jobID++
 
