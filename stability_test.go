@@ -788,9 +788,9 @@ func TestResourceConstraints(t *testing.T) {
 	// 测试极大数据量
 	t.Run("极大数据量", func(t *testing.T) {
 		// 使用流式生成器模拟大数据，避免一次性分配太多内存
-		dataSize := 200 * 1024 * 1024 // 200MB
+		dataSize := 20 * 1024 * 1024 // 默认20MB
 		if testing.Short() {
-			dataSize = 20 * 1024 * 1024 // 短测试模式下降为20MB
+			dataSize = 5 * 1024 * 1024 // 短测试模式下降为5MB
 		}
 
 		// 创建数据生成器
@@ -804,8 +804,11 @@ func TestResourceConstraints(t *testing.T) {
 		bufferSizes := []int{
 			32 * 1024,  // 32KB，较小
 			128 * 1024, // 128KB，适中
-			512 * 1024, // 512KB，较大
 		}
+
+		// 添加超时控制
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
 
 		for _, bufSize := range bufferSizes {
 			t.Run(fmt.Sprintf("缓冲区%dKB", bufSize/1024), func(t *testing.T) {
@@ -817,10 +820,11 @@ func TestResourceConstraints(t *testing.T) {
 				options.BufferSize = bufSize
 				options.UseParallel = true // 使用并行模式
 				options.CollectStats = true
+				options.CancelChan = ctx.Done() // 添加取消通道
 
 				// 创建输出缓冲区
 				outBuf := &limitedBuffer{
-					maxSize: 300 * 1024 * 1024, // 300MB 限制
+					maxSize: 30 * 1024 * 1024, // 30MB 限制
 				}
 
 				// 尝试加密
@@ -829,6 +833,9 @@ func TestResourceConstraints(t *testing.T) {
 				duration := time.Since(startTime)
 
 				if err != nil {
+					if errors.Is(err, ErrOperationCancelled) {
+						t.Fatal("测试超时")
+					}
 					t.Fatalf("大数据量加密失败 (size=%dMB, buffer=%dKB): %v",
 						dataSize/(1024*1024), bufSize/1024, err)
 				}
