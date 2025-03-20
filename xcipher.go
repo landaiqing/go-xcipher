@@ -37,6 +37,13 @@ const (
 	avxBufferSize = 128 * 1024 // Larger buffer size when using AVX optimization
 	sseBufferSize = 64 * 1024  // Buffer size when using SSE optimization
 	armBufferSize = 32 * 1024  // Buffer size when using ARM optimization
+
+	// Data format identifiers
+	magicNumber    = 0x58434950 // "XCIP" in hex
+	currentVersion = 0x01
+
+	// Format header size
+	headerSize = 8 // 4 bytes magic + 4 bytes version
 )
 
 // Define error constants for consistent error handling
@@ -51,6 +58,9 @@ var (
 	ErrBufferSizeTooSmall   = errors.New("xcipher: buffer size too small")
 	ErrBufferSizeTooLarge   = errors.New("xcipher: buffer size too large")
 	ErrOperationCancelled   = errors.New("xcipher: operation was cancelled")
+	ErrInvalidMagicNumber   = errors.New("xcipher: invalid magic number")
+	ErrUnsupportedVersion   = errors.New("xcipher: unsupported version")
+	ErrInvalidFormat        = errors.New("xcipher: invalid data format")
 )
 
 // Global memory pool to reduce small object allocations
@@ -221,6 +231,56 @@ func (x *XCipher) Decrypt(cipherData, additionalData []byte) ([]byte, error) {
 	return x.aead.Open(nil, nonce, data, additionalData)
 }
 
+// EncryptWithIntegrity performs encryption with data integrity verification
+func (x *XCipher) EncryptWithIntegrity(data, additionalData []byte) ([]byte, error) {
+	if len(data) == 0 {
+		return nil, ErrEmptyPlaintext
+	}
+
+	// Pre-allocate the buffer containing the header
+	requiredCapacity := headerSize + nonceSize + len(data) + x.overhead
+	result := make([]byte, headerSize, requiredCapacity)
+
+	// Write the magic number and version number
+	binary.BigEndian.PutUint32(result[0:4], magicNumber)
+	binary.BigEndian.PutUint32(result[4:8], currentVersion)
+
+	// Encrypt using the original Encrypt method
+	encrypted, err := x.Encrypt(data, additionalData)
+	if err != nil {
+		return nil, err
+	}
+
+	//  Combine headers and encrypted data
+	return append(result, encrypted...), nil
+}
+
+// DecryptWithIntegrity performs decryption with data integrity verification
+func (x *XCipher) DecryptWithIntegrity(cipherData, additionalData []byte) ([]byte, error) {
+	// Verify data integrity
+	if len(cipherData) < headerSize+minCiphertextSize {
+		return nil, ErrCiphertextShort
+	}
+
+	// Verify the magic number
+	magic := binary.BigEndian.Uint32(cipherData[0:4])
+	if magic != magicNumber {
+		return nil, ErrInvalidMagicNumber
+	}
+
+	// Verify the version number
+	version := binary.BigEndian.Uint32(cipherData[4:8])
+	if version != currentVersion {
+		return nil, ErrUnsupportedVersion
+	}
+
+	// Extract the encrypted data part
+	encryptedData := cipherData[headerSize:]
+
+	// Decrypt using the original Decrypt method
+	return x.Decrypt(encryptedData, additionalData)
+}
+
 // StreamStats contains statistics for stream encryption/decryption
 type StreamStats struct {
 	// Start time
@@ -278,6 +338,14 @@ func DefaultStreamOptions() StreamOptions {
 
 // EncryptStreamWithOptions performs stream encryption using configuration options
 func (x *XCipher) EncryptStreamWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (stats *StreamStats, err error) {
+	// Write format header first
+	header := make([]byte, headerSize)
+	binary.BigEndian.PutUint32(header[0:4], magicNumber)
+	binary.BigEndian.PutUint32(header[4:8], currentVersion)
+	if _, err := writer.Write(header); err != nil {
+		return stats, fmt.Errorf("%w: %v", ErrWriteFailed, err)
+	}
+
 	// Verify the buffer size
 	if options.BufferSize < minBufferSize {
 		return nil, fmt.Errorf("%w: %d is less than minimum %d",
@@ -721,6 +789,24 @@ func (x *XCipher) encryptStreamParallelWithOptions(reader io.Reader, writer io.W
 
 // DecryptStreamWithOptions performs stream decryption with configuration options
 func (x *XCipher) DecryptStreamWithOptions(reader io.Reader, writer io.Writer, options StreamOptions) (*StreamStats, error) {
+	// Read and verify format header
+	header := make([]byte, headerSize)
+	if _, err := io.ReadFull(reader, header); err != nil {
+		return nil, fmt.Errorf("%w: failed to read header: %v", ErrReadFailed, err)
+	}
+
+	// Verify magic number
+	magic := binary.BigEndian.Uint32(header[0:4])
+	if magic != magicNumber {
+		return nil, ErrInvalidMagicNumber
+	}
+
+	// Verify version
+	version := binary.BigEndian.Uint32(header[4:8])
+	if version != currentVersion {
+		return nil, ErrUnsupportedVersion
+	}
+
 	// Verify buffer size
 	if options.BufferSize < minBufferSize {
 		return nil, fmt.Errorf("%w: %d is less than minimum %d",
@@ -1411,5 +1497,71 @@ func unreadByte(reader io.Reader, b byte) error {
 	// But in our use case, it will only be changed during the validation phase, which doesn't affect subsequent processing
 	single := bytes.NewReader([]byte{b})
 	*(&reader) = io.MultiReader(single, reader)
+	return nil
+}
+
+// EncryptToBytes encrypted stream returns []byte
+func (x *XCipher) EncryptToBytes(plainReader io.Reader, additionalData []byte) ([]byte, error) {
+	// Create a memory buffer
+	buf := new(bytes.Buffer)
+
+	// Write format header
+	header := make([]byte, headerSize)
+	binary.BigEndian.PutUint32(header[0:4], magicNumber)
+	binary.BigEndian.PutUint32(header[4:8], currentVersion)
+	if _, err := buf.Write(header); err != nil {
+		return nil, fmt.Errorf("write header failed: %w", err)
+	}
+
+	// Streaming encryption is performed, and the results are written to the BUFF
+	if err := x.EncryptStream(plainReader, buf, additionalData); err != nil {
+		return nil, fmt.Errorf("encrypt failed: %w", err)
+	}
+
+	// Returns bytes directly in the buffer
+	return buf.Bytes(), nil
+}
+
+// DecryptToBytes Stream decryption and return []byte
+func (x *XCipher) DecryptToBytes(encryptedReader io.Reader, additionalData []byte) ([]byte, error) {
+	// Read and verify format header first
+	header := make([]byte, headerSize)
+	if _, err := io.ReadFull(encryptedReader, header); err != nil {
+		return nil, fmt.Errorf("read header failed: %w", err)
+	}
+
+	// Verify magic number and version
+	if err := verifyDataFormat(header); err != nil {
+		return nil, err
+	}
+
+	// Create a memory buffer
+	buf := new(bytes.Buffer)
+
+	// Streaming decryption is performed, and the results are written to the BUFF
+	if err := x.DecryptStream(encryptedReader, buf, additionalData); err != nil {
+		return nil, fmt.Errorf("decrypt failed: %w", err)
+	}
+
+	// Returns bytes directly in the buffer
+	return buf.Bytes(), nil
+}
+
+// Add helper function to verify data format integrity
+func verifyDataFormat(data []byte) error {
+	if len(data) < headerSize+minCiphertextSize {
+		return ErrInvalidFormat
+	}
+
+	magic := binary.BigEndian.Uint32(data[0:4])
+	if magic != magicNumber {
+		return ErrInvalidMagicNumber
+	}
+
+	version := binary.BigEndian.Uint32(data[4:8])
+	if version != currentVersion {
+		return ErrUnsupportedVersion
+	}
+
 	return nil
 }
