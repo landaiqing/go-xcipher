@@ -1524,44 +1524,35 @@ func (x *XCipher) EncryptToBytes(plainReader io.Reader, additionalData []byte) (
 
 // DecryptToBytes Stream decryption and return []byte
 func (x *XCipher) DecryptToBytes(encryptedReader io.Reader, additionalData []byte) ([]byte, error) {
-	// Read and verify format header first
-	header := make([]byte, headerSize)
-	if _, err := io.ReadFull(encryptedReader, header); err != nil {
-		return nil, fmt.Errorf("read header failed: %w", err)
+	// 读取整个加密数据
+	encryptedData, err := io.ReadAll(encryptedReader)
+	if err != nil {
+		return nil, fmt.Errorf("read data failed: %w", err)
 	}
 
-	// Verify magic number and version
-	if err := verifyDataFormat(header); err != nil {
-		return nil, err
+	if len(encryptedData) < headerSize {
+		return nil, ErrInvalidFormat
 	}
 
-	// Create a memory buffer
+	magic := binary.BigEndian.Uint32(encryptedData[0:4])
+	if magic != magicNumber {
+		return nil, ErrInvalidMagicNumber
+	}
+
+	version := binary.BigEndian.Uint32(encryptedData[4:8])
+	if version != currentVersion {
+		return nil, ErrUnsupportedVersion
+	}
+
 	buf := new(bytes.Buffer)
 
-	// Streaming decryption is performed, and the results are written to the BUFF
-	if err := x.DecryptStream(encryptedReader, buf, additionalData); err != nil {
+	if err := x.DecryptStream(
+		bytes.NewReader(encryptedData[headerSize:]),
+		buf,
+		additionalData,
+	); err != nil {
 		return nil, fmt.Errorf("decrypt failed: %w", err)
 	}
 
-	// Returns bytes directly in the buffer
 	return buf.Bytes(), nil
-}
-
-// Add helper function to verify data format integrity
-func verifyDataFormat(data []byte) error {
-	if len(data) < headerSize+minCiphertextSize {
-		return ErrInvalidFormat
-	}
-
-	magic := binary.BigEndian.Uint32(data[0:4])
-	if magic != magicNumber {
-		return ErrInvalidMagicNumber
-	}
-
-	version := binary.BigEndian.Uint32(data[4:8])
-	if version != currentVersion {
-		return ErrUnsupportedVersion
-	}
-
-	return nil
 }
